@@ -66,7 +66,8 @@ repetition so that thermal or frequency drift doesn't favour one scenario.
   steal cycles and pollute cache, and service time goes up.
 * **Placement verification**: the share of NIC interrupts that hit the
   intended CPUs, plus irq/softirq/busy % on the app cores and IRQ cores.
-  If something such as irqbalance moves the IRQs, you get a warning.
+  If something moves the IRQs during a run (a tuned profile, a script,
+  irqbalance), you get a warning.
 
 ## Requirements
 
@@ -215,19 +216,19 @@ sudo ./irqbench.py run --workload app --iface ens6 --app-match 'feedhandler' --a
      --irq-cpus 2-3 --peer ssh:ec2-user@10.0.1.20 --deploy \
      --feed pcap:/data/opra-sample.pcap --rates 1x,2x,4x --pcap-portmap 0-65535:31001 \
      --latency http://127.0.0.1:9464/metrics --latency-metric md_feed_to_handler_seconds \
-     --reps 5 --duration 20 --stop-irqbalance
+     --reps 5 --duration 20
 
 # Restarted per scenario (so same-wide is possible), your publisher, JSON latency from a CLI
 sudo ./irqbench.py run --workload app --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
      --app-cmd '/opt/md/bin/handler --cores {cpus} --config /opt/md/handler.toml' --app-ready log:'subscribed' \
      --peer ssh:ec2-user@10.0.1.20 --feed cmd:'/opt/md/bin/sim --dst {host}:{port} --mps {rate} --secs {duration}' \
      --rates 200000,1000000 --latency cmd:'/opt/md/bin/handler-ctl stats --json' \
-     --latency-reset-cmd '/opt/md/bin/handler-ctl stats --reset' --latency-unit us --stop-irqbalance
+     --latency-reset-cmd '/opt/md/bin/handler-ctl stats --reset' --latency-unit us
 
 # One-way wire->kernel latency with PTP-synced clocks; real message template, timestamp at byte 24
 sudo ./irqbench.py run --workload app --iface ens6 --app-pid 41233 --app-cpus auto --irq-cpus 2-3 \
      --peer ssh:ec2-user@10.0.1.20 --deploy --feed builtin --feed-payload /home/ec2-user/template.bin \
-     --feed-ts-offset 24 --feed-port 31001 --rates 100000,500000,2000000 --latency ptp --stop-irqbalance
+     --feed-ts-offset 24 --feed-port 31001 --rates 100000,500000,2000000 --latency ptp
 
 # Rehearsal with the synthetic feed handler on the isolated cores
 sudo ./irqbench.py run --workload app --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
@@ -290,8 +291,6 @@ real. The NIC is ENA, on the Nitro card.
   ideally on another metal instance or a large network-optimised one. It
   needs enough client threads (`--client-threads`, `--conns`) that it isn't
   the bottleneck.
-* irqbalance is enabled on Amazon Linux and Ubuntu AMIs, so pass
-  `--stop-irqbalance`.
 * On metal you control C-states and P-states yourself (for example
   `intel_idle.max_cstate=1`, or `cpupower idle-set`). Record your choice:
   deep C-states favour `same` with blocking servers.
@@ -309,7 +308,7 @@ sudo ./irqbench.py run --iface ens6 --app-cpus 4-7 --irq-cpus 8-11 \
      --scenarios same,separate,same-wide,smt-sibling,remote-numa \
      --peer ssh:ec2-user@10.0.1.20 --deploy --server-addr 10.0.2.15 \
      --client-threads 8 --client-cpus 2-9 --conns 32 \
-     --rates 50000,200000,500000,0 --reps 5 --stop-irqbalance
+     --rates 50000,200000,500000,0 --reps 5
 ```
 
 ## Getting trustworthy numbers
@@ -319,8 +318,9 @@ sudo ./irqbench.py run --iface ens6 --app-cpus 4-7 --irq-cpus 8-11 \
 * Set the governor to `performance` (`cpupower frequency-set -g performance`).
   Also think about C-states. Deep idle states favour `same` in blocking mode,
   and that effect is real, so decide whether you want it included.
-* If irqbalance is running, the tool refuses to run. Pass `--stop-irqbalance`
-  and the tool restarts it afterwards.
+* If a host runs irqbalance, the tool refuses to start rather than have its
+  placement undone. Add `--stop-irqbalance` on that host, and it is
+  restarted afterwards.
 * Keep other traffic off the test interface, and use ≥5 reps.
 * Do the same on the load generator: pin its threads and keep it quiet.
 
