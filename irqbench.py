@@ -837,6 +837,13 @@ def report(outdir):
                   f"channels={a.get('channels') or 'as found'}, peer {a['peer']}",
                   f"- AWS {meta['system'].get('aws') or 'n/a'}",
                   f"- {a['reps']} reps x {a['duration']}s; values are medians across reps (rate 0 = closed loop)", ""]
+    try:
+        sys.path.insert(0, HERE)
+        import irqreport
+        lines += [irqreport.scenario_markdown(runs, json.load(open(meta_path)) if os.path.exists(meta_path) else {}),
+                  "## Results", ""]
+    except Exception as e:
+        warn(f"scenario explanations skipped: {e}")
     hdr = ["mode", "rate", "scenario"] + [m[2] for m in METRICS]
     lines.append("| " + " | ".join(hdr) + " |")
     lines.append("|" + "---|" * len(hdr))

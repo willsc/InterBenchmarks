@@ -505,6 +505,163 @@ def chart_irq_placement(data, mode, t):
 
 
 # --------------------------------------------------------------------------- #
+# scenario explanations
+
+def cpus_str(cpus):
+    cpus = sorted(set(cpus))
+    out, i = [], 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(str(cpus[i]) if i == j else f"{cpus[i]}-{cpus[j]}")
+        i = j + 1
+    return ",".join(out) or "none"
+
+
+def observed_irq_cpus(runs, min_share=5.0):
+    """CPUs that took at least min_share % of NIC interrupts in any of these runs."""
+    cpus = set()
+    for r in runs:
+        byc = {int(k): v for k, v in r["system"].get("nic_irqs_by_cpu", {}).items()}
+        tot = sum(byc.values())
+        cpus |= {c for c, v in byc.items() if tot and 100.0 * v / tot >= min_share}
+    return sorted(cpus)
+
+
+def scenario_info(runs, meta):
+    """Concrete, per-run explanation of each scenario that appears in the results."""
+    a = meta.get("args", {})
+    app = meta.get("app_cpus", [])
+    irq = meta.get("irq_cpus", [])
+    nics = meta.get("system", {}).get("nics", {})
+    multiq = any((n.get("rx_queues") or 1) > 1 for n in nics.values())
+    rps = a.get("rps", "follow")
+    if rps == "auto":
+        rps = "off" if multiq else "follow"
+    rps_txt = {"follow": "RPS (software receive steering) is set to the same CPUs as the interrupts, so "
+                         "protocol processing runs there too.",
+               "off": "RPS is off: the NIC's RSS spreads flows across its queues in hardware.",
+               "keep": "RPS is left as it was found."}.get(rps, "")
+    steer = a.get("cpu_steer", False)
+    by_scen = {}
+    for r in runs:
+        by_scen.setdefault(r["scenario"], []).append(r)
+
+    def layout(name):
+        rs = by_scen.get(name, [])
+        srv = rs[0]["server_cpus"] if rs else app
+        ic = rs[0]["irq_cpus"] if rs else None
+        return srv, ic, rs
+
+    out = []
+    for name in SCENARIOS:
+        if name not in by_scen:
+            continue
+        srv, ic, rs = layout(name)
+        observed = observed_irq_cpus(rs)
+        if name == "default":
+            info = dict(
+                headline="Baseline: leave interrupts wherever the system put them",
+                setup=f"Server threads are pinned to the app CPUs ({cpus_str(srv)}). The benchmark doesn't touch "
+                      "IRQ affinity or RPS; they stay exactly as found when the run started (irqbalance is "
+                      f"stopped during the run). Interrupts were actually observed on CPU(s) "
+                      f"{cpus_str(observed)}.",
+                question="How much does deliberate placement gain over doing nothing?",
+                pros="No tuning, and it reflects what an untuned production host does.",
+                cons="Where the interrupts land is up to the driver and kernel, so the result can vary between "
+                     "hosts and reboots, and it may overlap the app cores by accident.",
+                irq_cpus=observed)
+        elif name == "same":
+            info = dict(
+                headline="Co-located: application and interrupts share the same cores",
+                setup=f"Server threads and NIC interrupts are both on the app CPUs ({cpus_str(srv)}). Each "
+                      f"interrupt is pinned to one of those CPUs, round robin. {rps_txt}"
+                      + (" CPU steering is on, so every request goes to the server thread on the same CPU "
+                         "that processed its packet in the kernel." if steer else ""),
+                question="Is it better to keep packet processing and the application on one core?",
+                pros="The packet's data is still in that core's cache when the app reads it. There's no "
+                     "cross-core wake-up, because the interrupt wakes the core that will run the app. "
+                     "It uses the fewest cores.",
+                cons="Interrupt and softirq work steals cycles from the application and evicts its cache. "
+                     "Under heavy load the network stack and the app compete for the same CPU, which "
+                     "usually shows up as a worse tail (p99/p99.9) and higher service time.",
+                irq_cpus=ic or [])
+        elif name == "separate":
+            info = dict(
+                headline="Isolated: interrupts get their own dedicated cores",
+                setup=f"Server threads are on the app CPUs ({cpus_str(srv)}). NIC interrupts are on separate "
+                      f"IRQ CPUs ({cpus_str(ic or [])}). {rps_txt}",
+                question="Does keeping interrupts off the application's cores improve latency or throughput?",
+                pros="The app cores do no interrupt work, so service time stays stable and tail latency "
+                     "under load is usually better.",
+                cons="Every request crosses cores: the IRQ core processes the packet and then wakes the "
+                     "app thread on another core (an IPI), and the packet data has to move between caches. "
+                     f"It also uses {len(set(ic or []))} extra core(s) compared with `same`.",
+                irq_cpus=ic or [])
+        elif name == "same-wide":
+            info = dict(
+                headline="Fairness check: same core budget as separate, but shared",
+                setup=f"Uses the same total CPUs as `separate` ({cpus_str(srv)}), with one server thread "
+                      "per CPU and the interrupts spread over all of them. "
+                      + (rps_txt if rps != "keep" else ""),
+                question="Does `separate` win because isolation helps, or only because it had more cores?",
+                pros="Puts `same` and `separate` on an equal hardware budget, which makes it the fair "
+                     "comparison for `separate`.",
+                cons="It runs more server threads than the other scenarios, so its per-thread load is lower "
+                     "and it isn't directly comparable to `same`.",
+                irq_cpus=ic or [])
+        elif name == "smt-sibling":
+            info = dict(
+                headline="Hyperthread siblings: own logical CPU, shared physical core",
+                setup=f"Server threads are on the app CPUs ({cpus_str(srv)}). Interrupts are on their "
+                      f"hyperthread siblings ({cpus_str(ic or [])}), which share L1/L2 cache and execution "
+                      "units with the app.",
+                question="Are hyperthread siblings a cheap way to isolate interrupts without giving up "
+                         "whole cores?",
+                pros="It uses no extra physical cores, and the packet data stays in the shared L1/L2.",
+                cons="The sibling still competes for the core's execution units and cache, so it isolates "
+                     "less than `separate`.",
+                irq_cpus=ic or [])
+        info.update(name=name, server_cpus=srv)
+        out.append(info)
+    return out
+
+
+READING_GUIDE = [
+    ("`separate` clearly better than both `same` and `same-wide`",
+     "Isolation itself helps, so dedicate cores to interrupts."),
+    ("`separate` better than `same` but not `same-wide`",
+     "The gain came from having more cores, not from isolation. Sharing all the cores is just as good."),
+    ("`same` better than or equal to `separate`",
+     "Co-locate: cache locality and no cross-core wake-up outweigh the interference, and you save cores. "
+     "This is typical at low or moderate load with blocking servers."),
+    ("The answer changes with load",
+     "Pick by your operating point. `same` often wins at low load and `separate` at high load, so look at "
+     "the load where your service actually runs."),
+    ("Everything is 'within noise'",
+     "Placement doesn't matter for this workload at this load. Add reps, raise the load, or increase "
+     "`--work-lines` before concluding."),
+]
+
+
+def scenario_markdown(runs, meta):
+    lines = ["## What the scenarios mean", ""]
+    for i in scenario_info(runs, meta):
+        lines += [f"### `{i['name']}`: {i['headline']}", "",
+                  f"- **Setup:** {i['setup']}",
+                  f"- **Question it answers:** {i['question']}",
+                  f"- **Expected upside:** {i['pros']}",
+                  f"- **Expected downside:** {i['cons']}", ""]
+    lines += ["### How to read the comparison", "",
+              "Every Δ is relative to `same`. `separate` vs `same` is the core question, and "
+              "`separate` vs `same-wide` checks whether a gain comes from isolation or just from more cores.", "",
+              "| if you see | it means |", "|---|---|"]
+    lines += [f"| {k} | {v} |" for k, v in READING_GUIDE]
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
 # findings & warnings
 
 def findings(data):
@@ -555,13 +712,15 @@ def warnings_for(data):
 # HTML
 
 CSS = """
-:root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
+:root{--app-bg:#cde2fb;--app-ink:#0d366b;--irq-bg:#fbe0d3;--irq-ink:#7a2a0c;
+color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
 --grid:#e1e0d9;--border:rgba(11,11,11,.10);--good:#006300;--bad:#c22f2f;--warn:#8a5a00;--chip:#f0efec}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d0d0d;
 --surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--border:rgba(255,255,255,.10);
---good:#0ca30c;--bad:#e66767;--warn:#fab219;--chip:#2c2c2a}}
+--good:#0ca30c;--bad:#e66767;--warn:#fab219;--chip:#2c2c2a;--app-bg:#184f95;--app-ink:#e8f1fd;--irq-bg:#7a2a0c;--irq-ink:#fde9df}}
 :root[data-theme="dark"]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;
---muted:#898781;--grid:#2c2c2a;--border:rgba(255,255,255,.10);--good:#0ca30c;--bad:#e66767;--warn:#fab219;--chip:#2c2c2a}
+--muted:#898781;--grid:#2c2c2a;--border:rgba(255,255,255,.10);--good:#0ca30c;--bad:#e66767;--warn:#fab219;--chip:#2c2c2a;
+--app-bg:#184f95;--app-ink:#e8f1fd;--irq-bg:#7a2a0c;--irq-ink:#fde9df}
 *{box-sizing:border-box}
 body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1240px;margin:0 auto;padding:24px 16px 64px}
@@ -584,6 +743,16 @@ td .rng{color:var(--muted);font-size:11px}
 ul.warn-list{padding-left:18px;margin:0}ul.warn-list li{margin:3px 0}
 details summary{cursor:pointer;color:var(--ink2);font-weight:600}
 nav a{color:var(--ink2);margin-right:14px;font-size:13px}
+.scen{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:16px}
+@media (max-width:760px){.scen{grid-template-columns:1fr}}
+.scen dl{margin:6px 0 0;display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;align-content:start}
+.scen dt{color:var(--ink2);font-weight:600}.scen dd{margin:0}
+.cpus{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.cpu{border:1px solid var(--border);border-radius:8px;padding:6px 8px;min-width:58px;background:var(--page);font-size:12px}
+.cpu .n{color:var(--muted);font-variant-numeric:tabular-nums}
+.tag{display:block;border-radius:4px;padding:0 5px;margin-top:3px;font-size:11px;font-weight:600}
+.tag.app{background:var(--app-bg);color:var(--app-ink)}.tag.irq{background:var(--irq-bg);color:var(--irq-ink)}
+.cpu.idle{opacity:.45}
 """
 
 JS = """
@@ -615,6 +784,12 @@ def esc(s):
     return html.escape(str(s))
 
 
+def md_code(s):
+    """Escape, then render `backticks` as <code>."""
+    import re
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(s))
+
+
 def build_html(data, outdir, made, embed=True):
     meta, a = data.meta, data.meta.get("args", {})
     sysi = meta.get("system", {})
@@ -626,7 +801,7 @@ def build_html(data, outdir, made, embed=True):
     parts.append(f"<h1>IRQ placement benchmark</h1><p class='sub'>{esc(title_host)} · "
                  f"{esc(meta.get('started', os.path.basename(os.path.abspath(outdir))))} · "
                  f"{len(data.runs)} runs</p>")
-    parts.append("<nav><a href='#findings'>Findings</a><a href='#charts'>Charts</a>"
+    parts.append("<nav><a href='#scenarios'>Scenarios</a><a href='#findings'>Findings</a><a href='#charts'>Charts</a>"
                  "<a href='#summary'>Summary table</a><a href='#setup'>Setup</a><a href='#runs'>Raw runs</a></nav>")
 
     # warnings
@@ -637,6 +812,32 @@ def build_html(data, outdir, made, embed=True):
         more = f"<p class='muted'>…and {len(warns) - 40} more</p>" if len(warns) > 40 else ""
         parts.append(f"<div class='card'><h3>Data quality warnings ({len(warns)})</h3>"
                      f"<ul class='warn-list'>{items}</ul>{more}</div>")
+
+    # scenario explanations
+    info = scenario_info(data.runs, meta)
+    shown = sorted({c for i in info for c in list(i["server_cpus"]) + list(i["irq_cpus"])})
+    parts.append("<h2 id='scenarios'>What the scenarios mean</h2><p class='sub'>Each scenario changes "
+                 "only where the server threads and the NIC interrupts run; the workload is identical. "
+                 "The CPU boxes show this run's actual layout.</p>")
+    for i in info:
+        boxes = []
+        for c in shown:
+            tags = ("<span class='tag app'>app</span>" if c in i["server_cpus"] else "") + \
+                   ("<span class='tag irq'>IRQ</span>" if c in i["irq_cpus"] else "")
+            boxes.append(f"<div class='cpu{'' if tags else ' idle'}'><span class='n'>CPU {c}</span>{tags}</div>")
+        parts.append(
+            f"<div class='card scen'><div><h3><span class='swatch' style='background:{T[i['name']]}'></span>"
+            f"<code>{esc(i['name'])}</code>: {md_code(i['headline'])}</h3><p>{md_code(i['setup'])}</p>"
+            f"<div class='cpus' aria-label='CPU layout'>{''.join(boxes)}</div></div>"
+            f"<dl><dt>Question</dt><dd>{md_code(i['question'])}</dd><dt>Upside</dt><dd>{md_code(i['pros'])}</dd>"
+            f"<dt>Downside</dt><dd>{md_code(i['cons'])}</dd></dl></div>")
+    guide = "".join(f"<tr><td class='l' style='white-space:normal'>{md_code(k)}</td>"
+                    f"<td class='l' style='white-space:normal'>{md_code(v)}</td></tr>" for k, v in READING_GUIDE)
+    parts.append("<div class='card'><h3>How to read the comparison</h3><p class='sub'>Every Δ is relative to "
+                 "<code>same</code>. <code>separate</code> vs <code>same</code> is the core question, and "
+                 "<code>separate</code> vs <code>same-wide</code> checks whether a gain comes from isolation "
+                 "or just from more cores.</p><div class='tablewrap'><table><thead><tr><th class='l'>If you see"
+                 f"</th><th class='l'>It means</th></tr></thead><tbody>{guide}</tbody></table></div></div>")
 
     # findings
     parts.append("<h2 id='findings'>Findings</h2><p class='sub'>Based on client p99 round-trip latency. "

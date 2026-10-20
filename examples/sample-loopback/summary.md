@@ -6,6 +6,50 @@
 - AWS n/a
 - 3 reps x 3.0s; values are medians across reps (rate 0 = closed loop)
 
+## What the scenarios mean
+
+### `default`: Baseline: leave interrupts wherever the system put them
+
+- **Setup:** Server threads are pinned to the app CPUs (2-3). The benchmark doesn't touch IRQ affinity or RPS; they stay exactly as found when the run started (irqbalance is stopped during the run). Interrupts were actually observed on CPU(s) 2,4.
+- **Question it answers:** How much does deliberate placement gain over doing nothing?
+- **Expected upside:** No tuning, and it reflects what an untuned production host does.
+- **Expected downside:** Where the interrupts land is up to the driver and kernel, so the result can vary between hosts and reboots, and it may overlap the app cores by accident.
+
+### `same`: Co-located: application and interrupts share the same cores
+
+- **Setup:** Server threads and NIC interrupts are both on the app CPUs (2-3). Each interrupt is pinned to one of those CPUs, round robin. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too. CPU steering is on, so every request goes to the server thread on the same CPU that processed its packet in the kernel.
+- **Question it answers:** Is it better to keep packet processing and the application on one core?
+- **Expected upside:** The packet's data is still in that core's cache when the app reads it. There's no cross-core wake-up, because the interrupt wakes the core that will run the app. It uses the fewest cores.
+- **Expected downside:** Interrupt and softirq work steals cycles from the application and evicts its cache. Under heavy load the network stack and the app compete for the same CPU, which usually shows up as a worse tail (p99/p99.9) and higher service time.
+
+### `separate`: Isolated: interrupts get their own dedicated cores
+
+- **Setup:** Server threads are on the app CPUs (2-3). NIC interrupts are on separate IRQ CPUs (4-5). RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too.
+- **Question it answers:** Does keeping interrupts off the application's cores improve latency or throughput?
+- **Expected upside:** The app cores do no interrupt work, so service time stays stable and tail latency under load is usually better.
+- **Expected downside:** Every request crosses cores: the IRQ core processes the packet and then wakes the app thread on another core (an IPI), and the packet data has to move between caches. It also uses 2 extra core(s) compared with `same`.
+
+### `same-wide`: Fairness check: same core budget as separate, but shared
+
+- **Setup:** Uses the same total CPUs as `separate` (2-5), with one server thread per CPU and the interrupts spread over all of them. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too.
+- **Question it answers:** Does `separate` win because isolation helps, or only because it had more cores?
+- **Expected upside:** Puts `same` and `separate` on an equal hardware budget, which makes it the fair comparison for `separate`.
+- **Expected downside:** It runs more server threads than the other scenarios, so its per-thread load is lower and it isn't directly comparable to `same`.
+
+### How to read the comparison
+
+Every Δ is relative to `same`. `separate` vs `same` is the core question, and `separate` vs `same-wide` checks whether a gain comes from isolation or just from more cores.
+
+| if you see | it means |
+|---|---|
+| `separate` clearly better than both `same` and `same-wide` | Isolation itself helps, so dedicate cores to interrupts. |
+| `separate` better than `same` but not `same-wide` | The gain came from having more cores, not from isolation. Sharing all the cores is just as good. |
+| `same` better than or equal to `separate` | Co-locate: cache locality and no cross-core wake-up outweigh the interference, and you save cores. This is typical at low or moderate load with blocking servers. |
+| The answer changes with load | Pick by your operating point. `same` often wins at low load and `separate` at high load, so look at the load where your service actually runs. |
+| Everything is 'within noise' | Placement doesn't matter for this workload at this load. Add reps, raise the load, or increase `--work-lines` before concluding. |
+
+## Results
+
 | mode | rate | scenario | rps | p50 us | p99 us | p99.9 us | svc p50 us | svc p99 us | lost % | app busy % | app irq+sirq % | IRQs on tgt % | AWS shaped |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | block | 0 | default | 559002.3 | 54.8 | 101.4 | 137.2 | 2.34 | 3.62 | 0.000 | 88.9 | 17.1 | 100.0 | 0 |
