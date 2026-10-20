@@ -2,8 +2,12 @@
 # Real IRQ-placement benchmark on AWS: a market-data app on isolated cores, fed
 # from a second instance over a dedicated ENI.  See examples/REAL-BENCHMARKS.md.
 #
+# Run this ON THE DUT (the machine under test, where your app runs), as root.
+# It drives the peer (load generator) over SSH; you never run anything on the
+# peer yourself.  Results are written to results/ on the DUT.
+#
 #   1. Edit the config block below.
-#   2. Run one phase at a time, on the machine under test:
+#   2. Run one phase at a time:
 #        sudo --preserve-env=SSH_AUTH_SOCK examples/run-real-benchmark.sh check
 #        ... rehearsal | pcap | cmd | ptp | samewide | rpc | all
 #   DRY_RUN=1 prints each phase's plan without touching anything:
@@ -13,27 +17,27 @@ set -euo pipefail
 # ---------------------------------------------------------------- config ---
 # Every value can be overridden from the environment, e.g. FEED_IFACE=ens7.
 FEED_IFACE=${FEED_IFACE-ens6}                  # ENA interface carrying the feed (not your SSH ENI)
-PEER=${PEER-ec2-user@10.0.1.20}                # load generator: same placement group and subnet
+PEER=${PEER-ec2-user@10.0.0.20}                # peer's CONTROL address (SSH); the feed itself goes ens6 -> ens6
 APP_CPUS=${APP_CPUS-8-11}                      # isolated cores the app runs on (samewide phase)
 IRQ_CPUS=${IRQ_CPUS-2-5}                       # housekeeping cores for the 'separate' scenario
 REHEARSAL_CPUS=${REHEARSAL_CPUS-8-11}          # isolated cores for the rehearsal / rpc phases
-PEER_CPU=${PEER_CPU-2}                         # publisher CPU on the peer
+PEER_CPU=${PEER_CPU-2}                         # publisher CPU, on the PEER
 
 APP_MATCH=${APP_MATCH-feedhandler}             # regex for the running app (attach phases)
 APP_CMD=${APP_CMD-'/opt/md/bin/feedhandler --cores {cpus} --config /etc/md/handler.toml'}
 APP_READY=${APP_READY-'log:all channels subscribed'}
 
 FEED_PORT=${FEED_PORT-31001}
-PCAP=${PCAP-/data/feeds/2026-10-01-open.pcap}  # local file (copied to the peer) or a path on the peer
+PCAP=${PCAP-/data/feeds/2026-10-01-open.pcap}  # file on the DUT (copied to the peer) or a path on the peer
 PCAP_RATES=${PCAP_RATES-1x,2x,4x}
-SIM_CMD=${SIM_CMD-'/opt/md/bin/sim --dst {host}:{port} --mps {rate} --secs {duration}'}
+SIM_CMD=${SIM_CMD-'/opt/md/bin/sim --dst {host}:{port} --mps {rate} --secs {duration}'}   # runs on the PEER
 SIM_RATES=${SIM_RATES-200000,1000000,3000000}
 PAYLOAD=${PAYLOAD-/home/ec2-user/one-valid-message.bin}   # ptp phase: message template on the peer
 TS_OFFSET=${TS_OFFSET-24}                      # ptp phase: byte offset the app ignores
 PTP_RATES=${PTP_RATES-100000,1000000}
 TAP_CPU=${TAP_CPU-1}                           # ptp phase: housekeeping core for the tap
 
-# How the app reports latency: set the Prometheus pair, or STATS_CMD (JSON), or neither.
+# How the app reports latency (URLs and commands run on the DUT): the Prometheus pair, STATS_CMD (JSON), or neither.
 PROM_URL=${PROM_URL-http://127.0.0.1:9464/metrics}
 PROM_METRIC=${PROM_METRIC-md_feed_to_handler_seconds}
 STATS_CMD=${STATS_CMD-}                        # e.g. '/opt/md/bin/handler-ctl stats --json'
@@ -128,6 +132,6 @@ case "${1:-}" in
     samewide) phase_samewide ;;
     rpc) phase_rpc ;;
     all) phase_check; phase_rehearsal; phase_pcap; phase_samewide ;;
-    *) sed -n '2,12p' "$0"; exit 2 ;;
+    *) sed -n '2,14p' "$0"; exit 2 ;;
 esac
 echo "results: $(ls -d results/"$STAMP"-* 2>/dev/null | tr '\n' ' ')"
