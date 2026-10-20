@@ -83,6 +83,9 @@ Results go in `results/<timestamp>/`:
 A difference is marked **clear** only when the min..max ranges across
 repetitions don't overlap. That needs at least 2 reps.
 
+A full sample (a loopback run, so it demonstrates the format only) is in
+[`examples/`](examples/README.md).
+
 Charts:
 
 | chart | what it answers |

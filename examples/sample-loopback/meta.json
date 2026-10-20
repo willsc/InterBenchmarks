@@ -1,0 +1,103 @@
+{
+  "args": {
+    "cmd": "run",
+    "iface": "bond0",
+    "app_cpus": "2-3",
+    "irq_cpus": "4-5",
+    "peer": "local",
+    "deploy": false,
+    "server_addr": "127.0.0.1",
+    "scenarios": "default,same,separate,same-wide",
+    "rates": "10000,40000,100000,0",
+    "reps": 3,
+    "duration": 3.0,
+    "warmup": 0.5,
+    "settle": 0.5,
+    "proto": "udp",
+    "server_mode": "block",
+    "server_threads": 0,
+    "work_lines": 256,
+    "wss_kb": 512,
+    "req_size": 64,
+    "resp_size": 64,
+    "client_threads": 2,
+    "client_cpus": "0,1",
+    "conns": 16,
+    "outstanding": 1,
+    "poisson": false,
+    "rps": "auto",
+    "cpu_steer": true,
+    "channels": null,
+    "irq_filter": null,
+    "stop_irqbalance": false,
+    "port": 9000,
+    "seed": 1,
+    "out": "examples/sample-loopback",
+    "bin": "/opt/InterBenchmarks/rpcbench",
+    "dry_run": false
+  },
+  "started": "20261020-214435",
+  "system": {
+    "hostname": "sample-host",
+    "kernel": "6.17.0-35-generic",
+    "cmdline": "(redacted)",
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+    "online_cpus": "0-15",
+    "governors": [
+      "powersave"
+    ],
+    "core_types": {
+      "0": "P",
+      "1": "P",
+      "2": "P",
+      "3": "P",
+      "4": "P",
+      "5": "P",
+      "6": "E",
+      "7": "E",
+      "8": "E",
+      "9": "E",
+      "10": "E",
+      "11": "E",
+      "12": "E",
+      "13": "E"
+    },
+    "nics": {
+      "enp44s0": {
+        "driver": "r8169",
+        "irqs": [
+          158
+        ],
+        "numa_node": -1,
+        "rx_queues": 1,
+        "speed": "2500",
+        "ethtool_i": "driver: r8169\nversion: 6.17.0-35-generic\nfirmware-version: rtl8125b-2_0.0.2 07/13/20\nexpansion-rom-version: \nbus-info: 0000:2c:00.0\nsupports-statistics: yes\nsupports-test: no\nsupports-eeprom-access: no\nsupports-register-dump: yes\nsupports-priv-flags: no\n",
+        "ethtool_l": "",
+        "ethtool_c": ""
+      }
+    },
+    "numa_nodes": {
+      "node0": "0-15"
+    },
+    "smt_active": "0",
+    "aws": {}
+  },
+  "initial_state": {
+    "irq_affinity": {
+      "158": "0-15"
+    },
+    "rps_cpus": {
+      "/sys/class/net/enp44s0/queues/rx-0": "0000"
+    },
+    "irqbalance_was_active": false,
+    "channels": {}
+  },
+  "app_cpus": [
+    2,
+    3
+  ],
+  "irq_cpus": [
+    4,
+    5
+  ]
+}
