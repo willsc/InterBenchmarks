@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <linux/filter.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -218,6 +219,7 @@ struct opts {
 	int resp_size;
 	/* server */
 	int spin;
+	int cpu_steer;
 	int work_lines;
 	int wss_kb;
 	double max_seconds;
@@ -257,7 +259,7 @@ struct srv_conn {
 
 struct srv_thread {
 	pthread_t tid;
-	int idx, cpu;
+	int idx, cpu, lfd;
 	hist_t svc;  /* recv returned -> reply sent */
 	hist_t work; /* compute portion only */
 	uint64_t requests;
@@ -296,6 +298,29 @@ static int reuseport_socket(int type)
 	return fd;
 }
 
+/*
+ * Steer each request to the server thread pinned on the CPU that ran the
+ * kernel's receive processing (IRQ/softirq/RPS CPU), using a classic BPF
+ * reuseport program: "if cpu == cpus[i] return i".  CPUs without a thread
+ * return an out-of-range index and the kernel falls back to hashing.  This is
+ * what makes "same" placement actually cache/wakeup-local on multi-queue NICs.
+ */
+static void attach_cpu_steering(int fd, struct srv_thread *ts)
+{
+	int n = O.nthreads, len = 2 * n + 2;
+	struct sock_filter *code = calloc(len, sizeof(*code));
+	code[0] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_CPU);
+	for (int i = 0; i < n; i++) {
+		code[1 + 2 * i] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ts[i].cpu, 0, 1);
+		code[2 + 2 * i] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, i);
+	}
+	code[len - 1] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, 0xffffffff);
+	struct sock_fprog prog = {.len = len, .filter = code};
+	if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &prog, sizeof(prog)) < 0)
+		die("SO_ATTACH_REUSEPORT_CBPF");
+	free(code);
+}
+
 static void *server_thread(void *arg)
 {
 	struct srv_thread *t = arg;
@@ -314,15 +339,7 @@ static void *server_thread(void *arg)
 	int ep = epoll_create1(0);
 	if (ep < 0)
 		die("epoll_create1");
-	int lfd;
-	if (O.tcp) {
-		lfd = reuseport_socket(SOCK_STREAM);
-		if (listen(lfd, 1024) < 0)
-			die("listen");
-	} else {
-		lfd = reuseport_socket(SOCK_DGRAM);
-	}
-	set_nonblock(lfd);
+	int lfd = t->lfd;
 	struct epoll_event ev = {.events = EPOLLIN, .data.ptr = NULL};
 	if (epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev) < 0)
 		die("epoll_ctl");
@@ -421,6 +438,15 @@ static int run_server(void)
 	for (int i = 0; i < O.nthreads; i++) {
 		ts[i].idx = i;
 		ts[i].cpu = O.cpus[i % O.ncpus];
+		/* sockets join the reuseport group in index order, which the BPF program relies on */
+		ts[i].lfd = reuseport_socket(O.tcp ? SOCK_STREAM : SOCK_DGRAM);
+		if (O.tcp && listen(ts[i].lfd, 1024) < 0)
+			die("listen");
+		set_nonblock(ts[i].lfd);
+	}
+	if (O.cpu_steer)
+		attach_cpu_steering(ts[0].lfd, ts);
+	for (int i = 0; i < O.nthreads; i++) {
 		if (pthread_create(&ts[i].tid, NULL, server_thread, &ts[i]))
 			die("pthread_create");
 	}
@@ -443,9 +469,9 @@ static int run_server(void)
 	}
 
 	printf("{\"role\":\"server\",\"proto\":\"%s\",\"mode\":\"%s\",\"threads\":%d,"
-	       "\"work_lines\":%d,\"wss_kb\":%d,",
+	       "\"work_lines\":%d,\"wss_kb\":%d,\"cpu_steer\":%s,",
 	       O.tcp ? "tcp" : "udp", O.spin ? "spin" : "block", O.nthreads, O.work_lines,
-	       O.wss_kb);
+	       O.wss_kb, O.cpu_steer ? "true" : "false");
 	hist_json(stdout, "service", &svc);
 	putchar(',');
 	hist_json(stdout, "work", &work);
@@ -707,6 +733,8 @@ static void usage(void)
 		"  --resp-size B        response size, >=16 (default 64)\n"
 		"server:\n"
 		"  --spin               busy-poll instead of blocking in epoll_wait\n"
+		"  --cpu-steer          deliver each request to the thread on the CPU that\n"
+		"                       processed it in the kernel (reuseport BPF)\n"
 		"  --work-lines N       random cache lines touched per request (default 256)\n"
 		"  --wss-kb N           per-thread working-set size in KiB (default 512)\n"
 		"  --max-seconds S      exit after S seconds (default: run until SIGINT/SIGTERM)\n"
@@ -734,7 +762,7 @@ int main(int argc, char **argv)
 	static struct option lo[] = {
 		{"proto", 1, 0, 'p'},	    {"port", 1, 0, 'P'},     {"threads", 1, 0, 't'},
 		{"cpus", 1, 0, 'c'},	    {"req-size", 1, 0, 'q'}, {"resp-size", 1, 0, 'r'},
-		{"spin", 0, 0, 's'},	    {"work-lines", 1, 0, 'w'}, {"wss-kb", 1, 0, 'W'},
+		{"spin", 0, 0, 's'},	    {"cpu-steer", 0, 0, 'S'},	    {"work-lines", 1, 0, 'w'}, {"wss-kb", 1, 0, 'W'},
 		{"max-seconds", 1, 0, 'M'}, {"host", 1, 0, 'H'},     {"conns", 1, 0, 'n'},
 		{"rate", 1, 0, 'R'},	    {"poisson", 0, 0, 'X'},  {"outstanding", 1, 0, 'o'},
 		{"duration", 1, 0, 'd'},    {"warmup", 1, 0, 'u'},   {"timeout-ms", 1, 0, 'T'},
@@ -752,6 +780,7 @@ int main(int argc, char **argv)
 		case 'q': O.req_size = atoi(optarg); break;
 		case 'r': O.resp_size = atoi(optarg); break;
 		case 's': O.spin = 1; break;
+		case 'S': O.cpu_steer = 1; break;
 		case 'w': O.work_lines = atoi(optarg); break;
 		case 'W': O.wss_kb = atoi(optarg); break;
 		case 'M': O.max_seconds = atof(optarg); break;

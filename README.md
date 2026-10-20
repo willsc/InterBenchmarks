@@ -22,6 +22,7 @@ accounting that shows where the interrupts actually landed.
 | `same` | APP | APP, one IRQ per core, round robin |
 | `separate` | APP | IRQ cores |
 | `same-wide` | APP ∪ IRQ (one thread per core) | APP ∪ IRQ |
+| `smt-sibling` | APP | the hyperthread siblings of APP |
 
 `separate` uses more cores than `same`. `same-wide` is the equal-budget
 control: "is it better to dedicate N cores to interrupts, or to share all the
@@ -82,9 +83,73 @@ across repetitions don't overlap.
 * `--work-lines` / `--wss-kb`: a bigger cache footprint makes interference
   from interrupts on the app cores more costly.
 * `--proto tcp` (it does more softirq work per request than UDP).
-* `--rps follow|off|keep`: by default, RPS steers protocol processing to the
-  same cores as the IRQs. This matters on single-queue NICs such as r8169,
-  where one IRQ alone cannot spread load.
+* `--rps auto|follow|off|keep`: `auto` (the default) makes RPS follow the IRQ
+  cores on single-queue NICs and turns it off on multi-queue NICs such as ENA,
+  where RSS already spreads the load.
+* `--no-cpu-steer`: by default, the server attaches a reuseport BPF program.
+  It delivers each request to the thread pinned on the CPU that did the
+  kernel's receive processing, so in `same` the IRQ, softirq and app thread
+  share one core and one cache. Turn it off to see plain hash-based placement.
+
+## Running on AWS metal instances
+
+Metal instances have no hypervisor, so `/proc/stat` and interrupt counts are
+real. The NIC is ENA, on the Nitro card.
+
+**Topology**
+* Run `sudo ./irqbench.py show --iface ens5`. It prints the NUMA nodes, the
+  SMT siblings, the NIC's NUMA node, and the queue IRQs (`ens5-Tx-Rx-N`).
+  The `ena-mgmnt` IRQ is excluded automatically.
+* Pick APP and IRQ CPUs on the **NIC's NUMA node**. The tool warns if they
+  aren't.
+* For `separate`, use IRQ CPUs that are **not** hyperthread siblings of the
+  APP CPUs. Keep the siblings of all the CPUs under test idle. Add
+  `smt-sibling` to `--scenarios` to measure "own logical CPU, shared physical
+  core" on its own.
+
+**Queues**
+* ENA usually has 8-32 queues. Queue n's IRQ goes to the n-th CPU in the set,
+  round robin. For a pure 1:1 queue/core mapping, add `--channels N`, where N
+  is the number of APP CPUs. This runs `ethtool -L`, which **resets the ENA
+  device**, and the original count is restored at the end. Send the benchmark
+  traffic over a **secondary ENI** so your SSH session doesn't drop.
+
+**Network shaping**
+* EC2 enforces PPS, bandwidth, conntrack and link-local limits per instance.
+  The tool records `ethtool -S` deltas (`*_allowance_exceeded`, drops) for
+  every run. If they go up, the run is flagged and counted in the
+  `AWS shaped` column. Those numbers reflect EC2 limits, not IRQ placement,
+  so lower `--rates`.
+* Security-group connection tracking costs CPU per packet. Open the test port
+  in both directions, from 0.0.0.0/0 or the peer's security group, so that
+  flows are not tracked.
+
+**Instances and OS**
+* Put the load generator in the **same cluster placement group** and AZ,
+  ideally on another metal instance or a large network-optimised one. It
+  needs enough client threads (`--client-threads`, `--conns`) that it isn't
+  the bottleneck.
+* irqbalance is enabled on Amazon Linux and Ubuntu AMIs, so pass
+  `--stop-irqbalance`.
+* On metal you control C-states and P-states yourself (for example
+  `intel_idle.max_cstate=1`, or `cpupower idle-set`). Record your choice:
+  deep C-states favour `same` with blocking servers.
+* `meta.json` records the instance type and AZ (from IMDSv2), plus the
+  `ethtool -i/-l/-c` output, including ENA's adaptive interrupt moderation
+  settings.
+* Prerequisites: `sudo dnf install -y gcc make ethtool` (AL2023) or
+  `apt install build-essential ethtool`.
+
+Example for a two-socket metal host where `ens6` (a secondary ENI) is on node
+0 (node 0 = CPUs 0-23 plus siblings 48-71):
+
+```bash
+sudo ./irqbench.py run --iface ens6 --app-cpus 4-7 --irq-cpus 8-11 \
+     --scenarios default,same,separate,same-wide,smt-sibling \
+     --peer ssh:ec2-user@10.0.1.20 --deploy --server-addr 10.0.2.15 \
+     --client-threads 8 --client-cpus 2-9 --conns 32 \
+     --rates 50000,200000,500000,0 --reps 5 --stop-irqbalance
+```
 
 ## Getting trustworthy numbers
 

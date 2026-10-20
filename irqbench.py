@@ -9,6 +9,8 @@ Scenarios (APP = --app-cpus, IRQ = --irq-cpus):
   separate   application on APP, NIC IRQs (+RPS) on the dedicated IRQ cores
   same-wide  application on APP+IRQ, NIC IRQs (+RPS) on APP+IRQ
              (same total core budget as "separate", but shared)
+  smt-sibling application on APP, NIC IRQs (+RPS) on the hyperthread
+             siblings of APP (separate logical CPUs, shared physical cores)
 
 Sub-commands:
   show      list the interface's IRQs, their affinity and RPS masks
@@ -34,7 +36,11 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCENARIOS = ("default", "same", "separate", "same-wide")
+SCENARIOS = ("default", "same", "separate", "same-wide", "smt-sibling")
+# per-device IRQs that are not RX/TX queues (ENA "ena-mgmnt", mlx5 "async", ...)
+NON_QUEUE_IRQ = re.compile(r"(?i)mgmnt|mgmt|async|admin|ctrl|-aq\b|misc")
+# ethtool -S counters worth recording; *allowance_exceeded are AWS ENA shaping drops
+NIC_STAT_KEYS = re.compile(r"allowance_exceeded|drop|miss|err|no_buf|timeout")
 REMOTE_DIR = ".irqbench"
 
 
@@ -101,6 +107,98 @@ def ncpus_possible():
     return len(parse_cpulist(read("/sys/devices/system/cpu/possible", "0")))
 
 
+def smt_siblings(cpu):
+    return parse_cpulist(read(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list", str(cpu)))
+
+
+def cpu_node(cpu):
+    for path in glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node*"):
+        return int(os.path.basename(path)[4:])
+    return 0
+
+
+def dev_numa_node(dev):
+    n = read(f"/sys/class/net/{dev}/device/numa_node", "-1")
+    return int(n) if n.lstrip("-").isdigit() else -1
+
+
+def ethtool(*argv):
+    try:
+        r = subprocess.run(["ethtool", *argv], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def get_channels(dev):
+    """Current rx/tx/combined channel counts from `ethtool -l`."""
+    out = ethtool("-l", dev)
+    cur = out.split("Current hardware settings:")[-1] if out else ""
+    vals = {}
+    for key in ("RX", "TX", "Combined"):
+        m = re.search(rf"^{key}:\s+(\d+)", cur, re.M)
+        if m:
+            vals[key.lower()] = int(m.group(1))
+    return vals
+
+
+def set_channels(dev, vals):
+    argv = ["ethtool", "-L", dev]
+    for k, v in vals.items():
+        if v:
+            argv += [k, str(v)]
+    subprocess.run(argv, check=True)
+
+
+def wait_link_up(devs, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(read(f"/sys/class/net/{d}/operstate") == "up" for d in devs):
+            return
+        time.sleep(0.5)
+    warn(f"links {devs} not up after {timeout}s")
+
+
+def nic_stats(devs):
+    out = {}
+    for d in devs:
+        stats = {}
+        for line in ethtool("-S", d).splitlines():
+            k, _, v = line.strip().rpartition(":")
+            if k and NIC_STAT_KEYS.search(k) and v.strip().isdigit():
+                stats[k.strip()] = int(v)
+        out[d] = stats
+    return out
+
+
+def nic_stats_delta(a, b):
+    out = {}
+    for d, stats in b.items():
+        for k, v in stats.items():
+            dv = v - a.get(d, {}).get(k, 0)
+            if dv:
+                out[f"{d}:{k}"] = dv
+    return out
+
+
+def aws_instance():
+    """Best-effort IMDSv2 lookup of the EC2 instance type / AZ (empty off AWS)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request("http://169.254.169.254/latest/api/token", method="PUT",
+                                     headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        token = urllib.request.urlopen(req, timeout=1).read().decode()
+        info = {}
+        for key, path in (("instance_type", "instance-type"),
+                          ("az", "placement/availability-zone")):
+            r = urllib.request.Request(f"http://169.254.169.254/latest/meta-data/{path}",
+                                       headers={"X-aws-ec2-metadata-token": token})
+            info[key] = urllib.request.urlopen(r, timeout=1).read().decode()
+        return info
+    except Exception:
+        return {}
+
+
 # --------------------------------------------------------------------------- #
 # discovery
 
@@ -147,7 +245,15 @@ def device_irqs(dev, name_filter=None):
     irqs = [i for i in irqs if os.path.exists(f"/proc/irq/{i}/smp_affinity_list")]
     if name_filter:
         irqs = [i for i in irqs if re.search(name_filter, names.get(i, ""))]
-    return irqs
+    else:
+        queue = [i for i in irqs if not NON_QUEUE_IRQ.search(names.get(i, ""))]
+        irqs = queue or irqs
+
+    def queue_no(i):  # "eth0-Tx-Rx-7" -> 7, so queue n is placed on the n-th CPU
+        last = names.get(i, "").split()[-1] if names.get(i) else ""
+        m = re.search(r"(\d+)\D*$", last)
+        return (int(m.group(1)) if m else 1 << 30, i)
+    return sorted(irqs, key=queue_no)
 
 
 def rx_queues(dev):
@@ -186,10 +292,17 @@ def system_info(devs):
         "core_types": {str(k): v for k, v in sorted(core_types().items())},
         "nics": {},
     }
+    info["numa_nodes"] = {os.path.basename(p): read(p + "/cpulist")
+                          for p in sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))}
+    info["smt_active"] = read("/sys/devices/system/cpu/smt/active")
     for d in devs:
         drv = os.path.basename(os.path.realpath(f"/sys/class/net/{d}/device/driver"))
-        info["nics"][d] = {"driver": drv, "irqs": device_irqs(d),
-                           "rx_queues": len(rx_queues(d)), "speed": read(f"/sys/class/net/{d}/speed")}
+        info["nics"][d] = {"driver": drv, "irqs": device_irqs(d), "numa_node": dev_numa_node(d),
+                           "rx_queues": len(rx_queues(d)), "speed": read(f"/sys/class/net/{d}/speed"),
+                           "ethtool_i": ethtool("-i", d), "ethtool_l": ethtool("-l", d),
+                           "ethtool_c": ethtool("-c", d)}
+    if devs:
+        info["aws"] = aws_instance()
     return info
 
 
@@ -212,18 +325,37 @@ class NicState:
                          if os.path.exists(f"{q}/rps_cpus")},
         }
 
-    def save(self, irqbalance_was_active):
+    def save(self, irqbalance_was_active, channels=None):
         self.saved = self.snapshot()
         self.saved["irqbalance_was_active"] = irqbalance_was_active
+        self.saved["channels"] = channels or {}
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         with open(self.state_file, "w") as f:
             json.dump(self.saved, f, indent=2)
+
+    def restore_all(self, state=None):
+        """Final restore: channel counts first (they can re-create IRQs), then affinity/RPS."""
+        state = state or self.saved
+        if not state:
+            return
+        for dev, vals in state.get("channels", {}).items():
+            if get_channels(dev) != vals:
+                log(f"restoring {dev} channels {vals}")
+                try:
+                    set_channels(dev, vals)
+                except (OSError, subprocess.CalledProcessError) as e:
+                    warn(f"restore channels on {dev}: {e}")
+        if state.get("channels"):
+            wait_link_up(list(state["channels"]))
+        self.apply_saved(state)
 
     def apply_saved(self, state=None):
         state = state or self.saved
         if not state:
             return
         for irq, aff in state["irq_affinity"].items():
+            if not os.path.exists(f"/proc/irq/{irq}/smp_affinity_list"):
+                continue
             try:
                 write(f"/proc/irq/{irq}/smp_affinity_list", aff)
             except OSError as e:
@@ -245,6 +377,8 @@ class NicState:
                 unmovable.append(irq)
         if unmovable:
             warn(f"IRQs {unmovable} could not be moved (kernel-managed?)")
+        if rps_mode == "auto":  # RSS already spreads multi-queue NICs; RPS only adds IPIs there
+            rps_mode = "follow" if all(len(rx_queues(d)) <= 1 for d in self.devs) else "off"
         if rps_mode == "follow":
             mask = cpumask_hex(irq_cpus, self.ncpus)
         elif rps_mode == "off":
@@ -391,6 +525,8 @@ def start_server(args, cpus, threads):
            "--req-size", str(args.req_size), "--resp-size", str(args.resp_size)]
     if args.server_mode == "spin":
         cmd.append("--spin")
+    if args.cpu_steer:
+        cmd.append("--cpu-steer")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -446,6 +582,11 @@ def scenario_layout(name, app, irq):
     if name == "same-wide":
         both = sorted(set(app) | set(irq))
         return both, both
+    if name == "smt-sibling":
+        sib = sorted({s for c in app for s in smt_siblings(c)} - set(app))
+        if not sib:
+            sys.exit("smt-sibling: app CPUs have no hyperthread siblings (SMT off?)")
+        return app, sib
     raise ValueError(name)
 
 
@@ -461,6 +602,22 @@ def preflight(args, app, irq, devs, nic):
             warn(msg + " (fine for a loopback smoke test)")
         else:
             sys.exit(msg)
+    nodes = {dev_numa_node(d) for d in devs} - {-1}
+    for label, cpus in (("app", app), ("irq", irq)):
+        cn = {cpu_node(c) for c in cpus}
+        if len(cn) > 1:
+            warn(f"{label} CPUs span NUMA nodes {sorted(cn)}")
+        if nodes and not cn <= nodes:
+            warn(f"{label} CPUs are on NUMA node(s) {sorted(cn)} but the NIC is on {sorted(nodes)}; "
+                 "cross-socket DMA/IRQ traffic will dominate the comparison")
+    shared = sorted(c for c in irq if any(c in smt_siblings(a) for a in app))
+    if shared:
+        warn(f"IRQ CPUs {fmt_cpulist(shared)} are hyperthread siblings of app CPUs, so 'separate' "
+             "still shares physical cores; use the smt-sibling scenario to test that explicitly")
+    idle_sibs = sorted({s for c in app + irq for s in smt_siblings(c)} - set(app) - set(irq))
+    if idle_sibs:
+        log(f"note: keep hyperthread siblings {fmt_cpulist(idle_sibs)} of the test CPUs idle "
+            "(no client, no other load)")
     types = core_types()
     if types:
         ta = {types.get(c) for c in app}
@@ -497,7 +654,7 @@ def cmd_run(args):
         m = re.search(r"inet (\S+)/", out)
         args.server_addr = "127.0.0.1" if args.peer == "local" or not m else m.group(1)
     if not args.client_cpus:
-        args.client_cpus = "0" if args.peer != "local" else fmt_cpulist(
+        args.client_cpus = f"0-{args.client_threads - 1}" if args.peer != "local" else fmt_cpulist(
             sorted(set(parse_cpulist(read("/sys/devices/system/cpu/online"))) - set(app) - set(irq))[:args.client_threads])
     preflight(args, app, irq, devs, nic)
 
@@ -516,6 +673,8 @@ def cmd_run(args):
     est = len(plan) * (args.duration + args.warmup + args.settle + 1)
     log(f"{len(plan)} runs, ~{est / 60:.1f} min")
     if args.dry_run:
+        if args.channels:
+            log(f"would set {devs} to {args.channels} queues (now {[get_channels(d) for d in devs]})")
         for rep, rate, s in plan:
             srv, ic = scenario_layout(s, app, irq)
             log(f"  rep {rep} rate {rate:g}: {s:9s} server@{fmt_cpulist(srv)} "
@@ -534,8 +693,23 @@ def cmd_run(args):
         log("stopping irqbalance")
         subprocess.run(["systemctl", "stop", "irqbalance"], check=True)
 
+    channels_before = {}
+    if args.channels:
+        channels_before = {d: get_channels(d) for d in devs}
+        # persist before touching the NIC so `restore` can undo it after a crash
+        nic.save(was_active, channels_before)
+        for d in devs:
+            key = "combined" if channels_before[d].get("combined") else "rx"
+            log(f"setting {d} {key} channels {channels_before[d].get(key)} -> {args.channels} "
+                "(ENA resets the device; use a dedicated ENI for test traffic)")
+            set_channels(d, {key: args.channels})
+        wait_link_up(devs)
+        time.sleep(2)
+        nic = NicState(devs, args.irq_filter, nic.state_file)
+        log(f"IRQs after channel change: {nic.irqs}")
+
     os.makedirs(outdir, exist_ok=True)
-    nic.save(was_active)
+    nic.save(was_active, channels_before)
     meta = {"args": vars(args), "started": stamp, "system": system_info(devs),
             "initial_state": nic.saved, "app_cpus": app, "irq_cpus": irq}
     with open(os.path.join(outdir, "meta.json"), "w") as f:
@@ -560,14 +734,17 @@ def cmd_run(args):
             server = start_server(args, srv_cpus, len(srv_cpus) if s == "same-wide" else args.server_threads or len(srv_cpus))
             try:
                 before = snapshot_counters(nic.irqs)
+                stats_before = nic_stats(devs)
                 client = run_client(args, peer, rate)
                 after = snapshot_counters(nic.irqs)
+                stats_after = nic_stats(devs)
             finally:
                 srv = stop_server(server)
             rec = {"rep": rep, "rate": rate, "scenario": s, "server_mode": args.server_mode,
                    "proto": args.proto, "server_cpus": srv_cpus, "irq_cpus": irq_cpus,
                    "effective_irq_affinity": eff, "client": client, "server": srv,
-                   "system": counter_delta(before, after, srv_cpus, target)}
+                   "system": counter_delta(before, after, srv_cpus, target),
+                   "nic_stats": nic_stats_delta(stats_before, stats_after)}
             with open(runs_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             sysd = rec["system"]
@@ -579,13 +756,17 @@ def cmd_run(args):
             if irq_cpus is not None and sysd["nic_irqs_on_target_pct"] is not None \
                     and sysd["nic_irqs_on_target_pct"] < 95:
                 warn("fewer than 95% of NIC interrupts hit the intended CPUs; is something rewriting affinity?")
+            shaped = {k: v for k, v in rec["nic_stats"].items() if "allowance_exceeded" in k}
+            if shaped:
+                warn(f"AWS network allowance exceeded during this run {shaped}: the instance was "
+                     "shaped, so latency/loss reflect EC2 limits, not IRQ placement; lower --rates")
             if sysd["nic_irqs_total"] == 0 and args.peer != "local":
                 warn("no NIC interrupts observed: is traffic using this interface?")
     except KeyboardInterrupt:
         warn("interrupted")
     finally:
-        log("restoring IRQ affinity and RPS")
-        nic.apply_saved()
+        log("restoring IRQ affinity, RPS and channels")
+        nic.restore_all()
         if was_active:
             subprocess.run(["systemctl", "start", "irqbalance"])
         if nic.snapshot()["irq_affinity"] != nic.saved["irq_affinity"]:
@@ -612,6 +793,8 @@ METRICS = [
     ("app_irq_soft_pct", lambda r: r["system"]["app_cpus"].get("irq", 0)
      + r["system"]["app_cpus"].get("softirq", 0), "app irq+sirq %", 1, None),
     ("irqs_on_target_pct", lambda r: r["system"]["nic_irqs_on_target_pct"] or 0, "IRQs on tgt %", 1, None),
+    ("allowance_exceeded", lambda r: sum(v for k, v in r.get("nic_stats", {}).items()
+                                         if "allowance_exceeded" in k), "AWS shaped", 0, None),
 ]
 
 
@@ -650,7 +833,9 @@ def report(outdir):
                   f"- iface `{a['iface']}` NICs {meta['system']['nics']}",
                   f"- app cpus `{fmt_cpulist(meta['app_cpus'])}`, irq cpus `{fmt_cpulist(meta['irq_cpus'])}`, "
                   f"proto {a['proto']}, server {a['server_mode']}, work {a['work_lines']} lines / "
-                  f"{a['wss_kb']} KiB, rps={a['rps']}, peer {a['peer']}",
+                  f"{a['wss_kb']} KiB, rps={a['rps']}, cpu-steer={a.get('cpu_steer')}, "
+                  f"channels={a.get('channels') or 'as found'}, peer {a['peer']}",
+                  f"- AWS {meta['system'].get('aws') or 'n/a'}",
                   f"- {a['reps']} reps x {a['duration']}s; values are medians across reps (rate 0 = closed loop)", ""]
     hdr = ["mode", "rate", "scenario"] + [m[2] for m in METRICS]
     lines.append("| " + " | ".join(hdr) + " |")
@@ -660,13 +845,13 @@ def report(outdir):
         vals += [f"{row[k]:.{d}f}" for k, _, _, d, _ in METRICS]
         lines.append("| " + " | ".join(vals) + " |")
 
-    lines += ["", "## separate vs same (and same-wide vs same)", "",
+    lines += ["", "## each scenario vs same", "",
               "Δ is relative to `same`. **clear** = the reps' min..max ranges do not overlap.", ""]
     lines.append("| mode | rate | compare | rps Δ | p50 Δ | p99 Δ | p99.9 Δ | svc p99 Δ | winner at p99 |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
     idx = {(r["server_mode"], r["rate"], r["scenario"]): r for r in rows}
     for (mode, rate, scen), row in sorted(idx.items()):
-        if scen not in ("separate", "same-wide") or (mode, rate, "same") not in idx:
+        if scen in ("same", "default") or (mode, rate, "same") not in idx:
             continue
         base = idx[(mode, rate, "same")]
 
@@ -674,10 +859,13 @@ def report(outdir):
             if not base[k]:
                 return "n/a"
             d = 100.0 * (row[k] - base[k]) / base[k]
-            clear = row[k + "_min"] > base[k + "_max"] or row[k + "_max"] < base[k + "_min"]
+            clear = min(row["reps"], base["reps"]) >= 2 and (
+                row[k + "_min"] > base[k + "_max"] or row[k + "_max"] < base[k + "_min"])
             return f"{d:+.1f}%" + (" **clear**" if clear else "")
 
-        if row["rtt_p99_us_max"] < base["rtt_p99_us_min"]:
+        if min(row["reps"], base["reps"]) < 2:
+            better = "need >=2 reps"
+        elif row["rtt_p99_us_max"] < base["rtt_p99_us_min"]:
             better = scen
         elif row["rtt_p99_us_min"] > base["rtt_p99_us_max"]:
             better = "same"
@@ -705,9 +893,13 @@ def cmd_show(args):
             by.setdefault(t, []).append(c)
         print("core types: " + ", ".join(f"{t}={fmt_cpulist(c)}" for t, c in sorted(by.items())))
     print(f"irqbalance active: {irqbalance_active()}")
+    for p in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        print(f"{os.path.basename(p)} cpus {read(p + '/cpulist')}")
+    print(f"SMT active: {read('/sys/devices/system/cpu/smt/active', '?')}, "
+          f"cpu0 siblings {fmt_cpulist(smt_siblings(0))}")
     for d in devs:
         drv = os.path.basename(os.path.realpath(f"/sys/class/net/{d}/device/driver"))
-        print(f"\n{d} (driver {drv})")
+        print(f"\n{d} (driver {drv}, NUMA node {dev_numa_node(d)}, channels {get_channels(d)})")
         for i in device_irqs(d, args.irq_filter):
             print(f"  IRQ {i:5d} {names.get(i, ''):30s} affinity {read(f'/proc/irq/{i}/smp_affinity_list')}"
                   f"  effective {read(f'/proc/irq/{i}/effective_affinity_list', '?')}")
@@ -721,7 +913,7 @@ def cmd_restore(args):
         sys.exit("no saved state found")
     state = json.load(open(path))
     nic = NicState([], None, path)
-    nic.apply_saved(state)
+    nic.restore_all(state)
     if state.get("irqbalance_was_active"):
         subprocess.run(["systemctl", "start", "irqbalance"])
     os.unlink(path)
@@ -763,8 +955,13 @@ def main():
     r.add_argument("--conns", type=int, default=16, help="sockets per client thread")
     r.add_argument("--outstanding", type=int, default=1, help="closed loop in-flight per socket")
     r.add_argument("--poisson", action="store_true", help="Poisson arrivals for open loop")
-    r.add_argument("--rps", choices=("follow", "off", "keep"), default="follow",
-                   help="RPS mask: follow the IRQ CPUs (default), disable, or keep as found")
+    r.add_argument("--rps", choices=("auto", "follow", "off", "keep"), default="auto",
+                   help="RPS mask: follow the IRQ CPUs, disable, or keep as found; "
+                        "auto = follow on single-queue NICs, off on multi-queue (default)")
+    r.add_argument("--no-cpu-steer", dest="cpu_steer", action="store_false",
+                   help="don't steer requests to the thread on the CPU that processed them")
+    r.add_argument("--channels", type=int,
+                   help="set NIC queue count for the run (e.g. = number of app CPUs); restored after")
     r.add_argument("--irq-filter", help="regex on /proc/interrupts name to select IRQs")
     r.add_argument("--stop-irqbalance", action="store_true")
     r.add_argument("--port", type=int, default=9000)
