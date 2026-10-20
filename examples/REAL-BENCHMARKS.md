@@ -129,7 +129,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --peer ssh:ec2-user@PEER_IP --deploy --feed-cpus 2 \
   --feed builtin --feed-burst 20 --feed-flows 8 --latency builtin \
   --rates 100000,500000,1000000 --reps 3 --duration 15 --warmup 3 \
-  --stop-irqbalance --out results/rehearsal
+  --out results/rehearsal
 ```
 
 In `results/rehearsal/report.html`, check:
@@ -159,7 +159,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --latency http://127.0.0.1:9464/metrics --latency-metric md_feed_to_handler_seconds \
   --reps 7 --duration 30 --warmup 5 --settle 2 \
   --scenarios same,separate,smt-sibling,remote-numa \
-  --stop-irqbalance --out results/real-pcap-prom
+  --out results/real-pcap-prom
 ```
 
 - **The pcap:** a local path is copied to the peer. A path that only exists on
@@ -179,7 +179,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --rates 200000,1000000,3000000 \
   --latency cmd:'/opt/md/bin/handler-ctl stats --json' \
   --latency-reset-cmd '/opt/md/bin/handler-ctl stats --reset' --latency-unit us \
-  --reps 7 --duration 30 --warmup 5 --stop-irqbalance --out results/real-sim-json
+  --reps 7 --duration 30 --warmup 5 --out results/real-sim-json
 ```
 
 The JSON keys `p50` / `p99` / `p99.9` / `max` (with `_us`/`_ns` suffixes) are
@@ -195,7 +195,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --feed builtin --feed-payload /home/ec2-user/one-valid-message.bin --feed-ts-offset 24 \
   --feed-port 31001 --feed-burst 20 \
   --rates 100000,1000000 --latency ptp --tap-cpu 1 \
-  --reps 7 --duration 30 --warmup 5 --stop-irqbalance --out results/real-ptp
+  --reps 7 --duration 30 --warmup 5 --out results/real-ptp
 ```
 
 - **The message:** every message is your real template, with the send
@@ -215,7 +215,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --app-ready log:'all channels subscribed' --app-ready-timeout 120 \
   --peer ssh:ec2-user@PEER_IP --feed pcap:/data/feeds/2026-10-01-open.pcap --rates 1x,4x \
   --latency http://127.0.0.1:9464/metrics --latency-metric md_feed_to_handler_seconds \
-  --reps 5 --duration 30 --warmup 10 --stop-irqbalance --out results/real-samewide
+  --reps 5 --duration 30 --warmup 10 --out results/real-samewide
 ```
 
 ### Optional: the synthetic RPC benchmark on the same hosts
@@ -223,7 +223,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
 ```bash
 sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
   --peer ssh:ec2-user@PEER_IP --deploy --client-threads 8 --client-cpus 2-9 --conns 32 \
-  --rates 50000,200000,500000,0 --server-mode spin --reps 5 --duration 20 --stop-irqbalance \
+  --rates 50000,200000,500000,0 --server-mode spin --reps 5 --duration 20 \
   --out results/rpc-spin
 ```
 
@@ -268,8 +268,8 @@ Open `report.html` and read it in this order:
 - **Restore:** every run saves the original IRQ affinity, RPS and channel
   settings first, and restores them on exit, Ctrl-C or SIGTERM. If the
   process is killed with `-9`, run `sudo ./irqbench.py restore`.
-- **irqbalance** is stopped during the run (`--stop-irqbalance`) and
-  restarted at the end.
+- **irqbalance:** these hosts don't run it. If a host does, the run refuses to start rather
+  than have its placement undone. Add `--stop-irqbalance` there, and it is restarted afterwards.
 - **`--channels`** resets the ENA device. Only use it on the feed ENI, never
   the one carrying your SSH session.
 - **Rehearse first:** do step 3 on a non-production pair. `same` deliberately

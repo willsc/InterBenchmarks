@@ -49,7 +49,7 @@ SCENARIOS=${SCENARIOS-same,separate,smt-sibling,remote-numa}   # the proximity l
 cd "$(dirname "$0")/.."
 STAMP=$(date +%Y%m%d-%H%M%S)
 COMMON=(--iface "$FEED_IFACE" --irq-cpus "$IRQ_CPUS" --peer "ssh:$PEER" --feed-port "$FEED_PORT"
-        --reps "$REPS" --duration "$DURATION" --warmup "$WARMUP" --stop-irqbalance)
+        --reps "$REPS" --duration "$DURATION" --warmup "$WARMUP")
 
 # latency flags for the app phases, as an array so commands with spaces survive
 if [[ -n "$PROM_URL" && -n "$PROM_METRIC" ]]; then
