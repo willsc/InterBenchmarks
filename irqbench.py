@@ -15,7 +15,7 @@ Scenarios (APP = --app-cpus, IRQ = --irq-cpus):
 Sub-commands:
   show      list the interface's IRQs, their affinity and RPS masks
   run       run the benchmark matrix (needs root on the machine under test)
-  report    re-generate the summary for an existing results directory
+  report    re-generate summary.md/csv, report.html and charts/*.png
   restore   restore IRQ/RPS state saved by an interrupted run
 
 Only the Python standard library is used.
@@ -877,6 +877,12 @@ def report(outdir):
     with open(os.path.join(outdir, "summary.md"), "w") as f:
         f.write(md)
     print(md)
+    try:
+        sys.path.insert(0, HERE)
+        import irqreport
+        irqreport.build(outdir)
+    except Exception as e:  # the markdown/CSV summary is still usable
+        warn(f"HTML/PNG report failed: {e}")
     log(f"results in {outdir}")
 
 

@@ -10,6 +10,7 @@ accounting that shows where the interrupts actually landed.
 | file | role |
 |---|---|
 | `src/rpcbench.c` | Request/response server and open/closed-loop load generator (UDP or TCP). It prints JSON. |
+| `irqreport.py` | Builds the HTML report and PNG charts from a results directory. `irqbench.py` runs it automatically, and you can also run it on its own on any machine. |
 | `irqbench.py` | Orchestrator for the machine under test (DUT). It applies each placement, runs the load, collects `/proc/interrupts`, `/proc/softirqs` and `/proc/stat` deltas, restores the original state, and writes a report. |
 
 ## Scenarios
@@ -45,7 +46,8 @@ frequency drift doesn't favour one scenario.
 
 ## Requirements
 
-* The DUT needs Linux, root, `gcc`, `make` and Python 3.8+ (stdlib only).
+* The DUT needs Linux, root, `gcc`, `make` and Python 3.8+ (stdlib only). For
+  charts it also needs `matplotlib` ≥ 3.7, but you can render on another machine instead.
 * A **second machine** generates load. Loopback traffic never raises NIC
   interrupts, so `--peer local` only checks that the tooling works.
 * Use passwordless SSH from the DUT to the peer. `--deploy` copies
@@ -70,10 +72,37 @@ sudo ./irqbench.py restore                      # only if a run was killed -9
 ```
 
 Results go in `results/<timestamp>/`:
-`meta.json` (host, kernel, governor, NICs, initial IRQ/RPS state),
-`runs.jsonl` (every run, raw), `summary.csv`, and `summary.md`. In
-`summary.md`, a difference is marked **clear** only when the min..max ranges
-across repetitions don't overlap.
+
+| file | contents |
+|---|---|
+| `report.html` | **Self-contained report.** Data-quality warnings (AWS shaping, mis-placed IRQs, loss, load generator falling behind), per-load findings, every chart, a sortable summary table (median with min–max), a change-vs-`same` table, the setup, and all raw runs. It follows the viewer's light/dark setting. |
+| `charts/*.png` | Each chart as a PNG (light), plus `*-dark.png` versions. |
+| `summary.md`, `summary.csv` | The same summary as text and CSV. |
+| `runs.jsonl`, `meta.json` | Raw per-run records, and host/NIC/initial-state metadata. |
+
+A difference is marked **clear** only when the min..max ranges across
+repetitions don't overlap. That needs at least 2 reps.
+
+Charts:
+
+| chart | what it answers |
+|---|---|
+| `latency-vs-load` | RTT p50 / p99 / p99.9 for each scenario as offered load rises |
+| `throughput` | closed-loop maximum throughput and p99 at that throughput |
+| `delta-vs-same` | heatmap of the % change against `same` (blue = better, red = worse, ● = clear) |
+| `percentile-spectrum` | p50 → max for each load, showing where the tails split apart |
+| `service-time` | server-side service time and compute-only time (interference on the app cores) |
+| `cpu-accounting` | irq+softirq % and busy % on the app cores, and involuntary context switches |
+| `irq-placement` | share of NIC interrupts per CPU at the highest load (verifies placement) |
+
+Charts need `matplotlib` (`pip install matplotlib`). If it's missing, the HTML
+report still has every table. You can copy the results directory to a laptop
+and render it there:
+
+```bash
+./irqreport.py results/<timestamp>                 # report.html + charts/
+./irqreport.py results/<timestamp> --link-images   # reference the PNGs instead of embedding them
+```
 
 ### Dimensions worth sweeping (one run each)
 
