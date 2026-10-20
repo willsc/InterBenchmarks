@@ -12,6 +12,11 @@ Scenarios (APP = --app-cpus, IRQ = --irq-cpus):
   smt-sibling application on APP, NIC IRQs (+RPS) on the hyperthread
              siblings of APP (separate logical CPUs, shared physical cores)
 
+Workloads (--workload):
+  rpc       synthetic request/response server + load generator (default)
+  app       your application (e.g. a market-data feed handler pinned to
+            isolated cores), driven by a feed: see irqapp.py and the README
+
 Sub-commands:
   show      list the interface's IRQs, their affinity and RPS masks
   run       run the benchmark matrix (needs root on the machine under test)
@@ -30,6 +35,7 @@ import random
 import re
 import shlex
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -314,6 +320,12 @@ class NicState:
         self.devs = devs
         self.irqs = sorted({i for d in devs for i in device_irqs(d, irq_filter)})
         self.rxq = [q for d in devs for q in rx_queues(d)]
+        names = irq_names()
+        self.irq_queue = {}
+        for i in self.irqs:
+            m = re.search(r"(\d+)\D*$", (names.get(i) or "").split()[-1] if names.get(i) else "")
+            if m:
+                self.irq_queue[i] = int(m.group(1))
         self.state_file = state_file
         self.saved = None
         self.ncpus = ncpus_possible()
@@ -366,11 +378,21 @@ class NicState:
             except OSError as e:
                 warn(f"restore {q}/rps_cpus: {e}")
 
-    def place(self, irq_cpus, rps_mode):
-        """Pin each IRQ to one CPU of irq_cpus (round robin) and steer RPS."""
+    def order_by_queues(self, rank):
+        """Busiest queues first, so they get the first CPUs of each placement."""
+        pos = {q: n for n, q in enumerate(rank)}
+        self.irqs.sort(key=lambda i: (pos.get(self.irq_queue.get(i), 1 << 30), self.irq_queue.get(i, i)))
+
+    def place(self, irq_cpus, rps_mode, irq_map=None):
+        """Pin each IRQ to one CPU of irq_cpus (round robin, or queue:cpu from irq_map) and steer RPS."""
         unmovable = []
-        for n, irq in enumerate(self.irqs):
-            cpu = irq_cpus[n % len(irq_cpus)]
+        rr = 0
+        for irq in self.irqs:
+            if irq_map and self.irq_queue.get(irq) in irq_map:
+                cpu = irq_map[self.irq_queue[irq]]
+            else:
+                cpu = irq_cpus[rr % len(irq_cpus)]
+                rr += 1
             try:
                 write(f"/proc/irq/{irq}/smp_affinity_list", str(cpu))
             except OSError:
@@ -633,16 +655,87 @@ def preflight(args, app, irq, devs, nic):
              "Results only validate the tooling, not IRQ placement.")
 
 
+class RpcWorkload:
+    """The synthetic request/response workload (rpcbench server + client)."""
+    kind = "rpc"
+
+    def __init__(self, args, peer):
+        self.args, self.peer = args, peer
+        self.mode_label = args.server_mode
+
+    def meta(self):
+        return {"workload": "rpc"}
+
+    def supports(self, scenario):
+        return None
+
+    def prepare(self):
+        pass
+
+    def run_one(self, rep, load, scenario, srv_cpus, target, nic):
+        a = self.args
+        threads = len(srv_cpus) if scenario == "same-wide" else a.server_threads or len(srv_cpus)
+        server = start_server(a, srv_cpus, threads)
+        try:
+            before = snapshot_counters(nic.irqs)
+            stats_before = nic_stats(nic.devs)
+            client = run_client(a, self.peer, load[0])
+            after = snapshot_counters(nic.irqs)
+            stats_after = nic_stats(nic.devs)
+        finally:
+            srv = stop_server(server)
+        return {"workload": "rpc", "load_label": load[1], "client": client, "server": srv,
+                "system": counter_delta(before, after, srv_cpus, target),
+                "nic_stats": nic_stats_delta(stats_before, stats_after)}
+
+    def log_line(self, rec):
+        c, srv = rec["client"], rec["server"]
+        return (f"{c['achieved_rps']:.0f} rps, p50 {c['rtt']['p50_ns'] / 1e3:.1f}us "
+                f"p99 {c['rtt']['p99_ns'] / 1e3:.1f}us p99.9 {c['rtt']['p999_ns'] / 1e3:.1f}us, "
+                f"svc p99 {srv['service']['p99_ns'] / 1e3:.2f}us, lost {c['lost_pct']:.3f}%")
+
+
+def rpc_loads(spec):
+    out = []
+    for r in spec.split(","):
+        v = float(r)
+        out.append((v, "closed loop" if v == 0 else f"{v:g}"))
+    return out
+
+
+def calibrate_queues(nic, workload, load, seconds):
+    """Run the feed briefly and rank NIC queues by received packets, busiest first."""
+    import irqapp
+    log(f"calibrating: which NIC queues carry the feed ({seconds:g}s at {load[1]})")
+    nic.apply_saved()
+    if workload.app.restart:
+        workload.app.start(parse_cpulist(workload.args.app_cpus))
+    try:
+        h = workload.feed.start(load, seconds + 1.5)
+        time.sleep(0.75)
+        q0 = irqapp.queue_rx(nic.devs)
+        time.sleep(seconds)
+        q1 = irqapp.queue_rx(nic.devs)
+        workload.feed.finish(h)
+    finally:
+        if workload.app.restart:
+            workload.app.stop()
+    d = irqapp.delta(q0, q1)
+    rank = [int(k.rsplit(":", 1)[1]) for k, _ in sorted(d.items(), key=lambda kv: -kv[1])]
+    if rank:
+        log(f"busiest queues: {', '.join(f'{k}={v}' for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:8])}")
+    else:
+        warn("no per-queue RX counters found (or no traffic); IRQs are placed in queue-number order")
+    return rank, d
+
+
 def cmd_run(args):
     if os.geteuid() != 0 and not args.dry_run:
         sys.exit("run needs root (writes /proc/irq/*/smp_affinity_list and rps_cpus)")
-    app = parse_cpulist(args.app_cpus)
-    irq = parse_cpulist(args.irq_cpus)
     scenarios = [s.strip() for s in args.scenarios.split(",")]
     for s in scenarios:
         if s not in SCENARIOS:
             sys.exit(f"unknown scenario {s}; choose from {SCENARIOS}")
-    rates = [float(r) for r in args.rates.split(",")]
 
     devs = physical_devs(args.iface)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -653,37 +746,80 @@ def cmd_run(args):
                              capture_output=True, text=True).stdout
         m = re.search(r"inet (\S+)/", out)
         args.server_addr = "127.0.0.1" if args.peer == "local" or not m else m.group(1)
+    peer = Peer(args.peer, args.bin)
+
+    if args.workload == "app":
+        sys.path.insert(0, HERE)
+        import irqapp
+        if not (args.app_cmd or args.app_pid or args.app_match):
+            sys.exit("--workload app needs --app-cmd (restart per scenario) or --app-pid/--app-match (attach)")
+        args.feed_dest = args.feed_dest or args.server_addr
+        args.feed_dest_ip = socket.gethostbyname(args.feed_dest)
+        workload = irqapp.AppWorkload(args, peer, outdir, devs)
+        loads = irqapp.parse_loads(args.rates or {"builtin": "100000,500000", "pcap": "1x"}.get(
+            workload.feed.kind, "0"), workload.feed.kind)
+        if args.app_cpus == "auto":
+            if workload.app.restart:
+                sys.exit("--app-cpus auto only works when attaching to a running app")
+            workload.app.attach()
+            args.app_cpus = fmt_cpulist(workload.app.pinned_cpus())
+            if not args.app_cpus:
+                sys.exit("the app's threads are not pinned; pass --app-cpus")
+            log(f"app threads are pinned to CPUs {args.app_cpus}")
+    else:
+        workload = RpcWorkload(args, peer)
+        loads = rpc_loads(args.rates or "10000,50000,0")
+    if not args.app_cpus:
+        sys.exit("--app-cpus is required (or 'auto' when attaching to a pinned app)")
+    app = parse_cpulist(args.app_cpus)
+    irq = parse_cpulist(args.irq_cpus)
     if not args.client_cpus:
         args.client_cpus = f"0-{args.client_threads - 1}" if args.peer != "local" else fmt_cpulist(
             sorted(set(parse_cpulist(read("/sys/devices/system/cpu/online"))) - set(app) - set(irq))[:args.client_threads])
+    if args.workload == "app" and not args.feed_cpus:
+        args.feed_cpus = args.client_cpus.split(",")[0].split("-")[0]
+    skipped = {}
+    for s in list(scenarios):
+        why = workload.supports(s)
+        if why:
+            warn(f"skipping scenario {s}: {why}")
+            skipped[s] = why
+            scenarios.remove(s)
     preflight(args, app, irq, devs, nic)
+    irq_map = {}
+    if args.irq_map:
+        for kv in args.irq_map.split(","):
+            q, c = kv.split(":")
+            irq_map[int(q)] = int(c)
 
     rng = random.Random(args.seed)
     plan = []
     for rep in range(args.reps):
-        for rate in rates:
+        for load in loads:
             order = list(scenarios)
             rng.shuffle(order)
             for s in order:
-                plan.append((rep, rate, s))
+                plan.append((rep, load, s))
 
     log(f"interface {args.iface} -> devices {devs}, IRQs {nic.irqs}, {len(nic.rxq)} rx queues")
-    log(f"app cpus {fmt_cpulist(app)}, irq cpus {fmt_cpulist(irq)}, server {args.server_mode}, "
-        f"{args.proto}, peer {args.peer}, server addr {args.server_addr}")
+    log(f"workload {workload.kind} ({workload.mode_label}), app cpus {fmt_cpulist(app)}, "
+        f"irq cpus {fmt_cpulist(irq)}, peer {args.peer}, server addr {args.server_addr}")
+    if args.workload == "app":
+        log(f"feed: {workload.feed.describe()}; latency: {workload.lat.name}")
     est = len(plan) * (args.duration + args.warmup + args.settle + 1)
     log(f"{len(plan)} runs, ~{est / 60:.1f} min")
     if args.dry_run:
         if args.channels:
             log(f"would set {devs} to {args.channels} queues (now {[get_channels(d) for d in devs]})")
-        for rep, rate, s in plan:
+        for rep, load, s in plan:
             srv, ic = scenario_layout(s, app, irq)
-            log(f"  rep {rep} rate {rate:g}: {s:9s} server@{fmt_cpulist(srv)} "
+            log(f"  rep {rep} load {load[1]}: {s:11s} app@{fmt_cpulist(srv)} "
                 f"irqs@{fmt_cpulist(ic) if ic else 'as-found'} rps={args.rps if ic else 'as-found'}")
         return
 
-    peer = Peer(args.peer, args.bin)
     if args.deploy:
         peer.deploy()
+    workload.prepare()
 
     was_active = irqbalance_active()
     if was_active:
@@ -711,9 +847,12 @@ def cmd_run(args):
     os.makedirs(outdir, exist_ok=True)
     nic.save(was_active, channels_before)
     meta = {"args": vars(args), "started": stamp, "system": system_info(devs),
-            "initial_state": nic.saved, "app_cpus": app, "irq_cpus": irq}
-    with open(os.path.join(outdir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+            "initial_state": nic.saved, "app_cpus": app, "irq_cpus": irq,
+            "skipped_scenarios": skipped, "loads": [list(l) for l in loads]}
+    meta.update(workload.meta())
+    if args.workload == "app":
+        meta["irqs_allowed_on_app_cpus"] = irqapp.irqs_on_cpus(app)
+        meta["clock"] = irqapp.clock_status(peer)
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
@@ -721,38 +860,33 @@ def cmd_run(args):
 
     runs_path = os.path.join(outdir, "runs.jsonl")
     try:
-        for n, (rep, rate, s) in enumerate(plan, 1):
+        if args.workload == "app" and args.calibrate > 0 and workload.feed.kind != "live":
+            rank, qd = calibrate_queues(nic, workload, loads[-1], args.calibrate)
+            nic.order_by_queues(rank)
+            meta["queue_calibration"] = {"rx_by_queue": qd, "irq_order": nic.irqs}
+        with open(os.path.join(outdir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+        for n, (rep, load, s) in enumerate(plan, 1):
             srv_cpus, irq_cpus = scenario_layout(s, app, irq)
             if irq_cpus is None:
                 nic.apply_saved()
             else:
-                nic.place(irq_cpus, args.rps)
+                nic.place(irq_cpus, args.rps, irq_map if s == "same" else None)
             time.sleep(args.settle)
             eff = nic.effective()
             target = irq_cpus if irq_cpus is not None else sorted(
                 {c for v in eff.values() if v for c in parse_cpulist(v)})
-            server = start_server(args, srv_cpus, len(srv_cpus) if s == "same-wide" else args.server_threads or len(srv_cpus))
-            try:
-                before = snapshot_counters(nic.irqs)
-                stats_before = nic_stats(devs)
-                client = run_client(args, peer, rate)
-                after = snapshot_counters(nic.irqs)
-                stats_after = nic_stats(devs)
-            finally:
-                srv = stop_server(server)
-            rec = {"rep": rep, "rate": rate, "scenario": s, "server_mode": args.server_mode,
-                   "proto": args.proto, "server_cpus": srv_cpus, "irq_cpus": irq_cpus,
-                   "effective_irq_affinity": eff, "client": client, "server": srv,
-                   "system": counter_delta(before, after, srv_cpus, target),
-                   "nic_stats": nic_stats_delta(stats_before, stats_after)}
+            if irq_map and s == "same":
+                target = sorted(set(target) | set(irq_map.values()))
+            rec = {"rep": rep, "rate": load[0], "scenario": s, "server_mode": workload.mode_label,
+                   "proto": args.proto if args.workload == "rpc" else "udp", "server_cpus": srv_cpus,
+                   "irq_cpus": irq_cpus, "effective_irq_affinity": eff}
+            rec.update(workload.run_one(rep, load, s, srv_cpus, target, nic))
             with open(runs_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             sysd = rec["system"]
-            log(f"[{n}/{len(plan)}] rep {rep} rate {rate:g} {s:9s}: "
-                f"{client['achieved_rps']:.0f} rps, p50 {client['rtt']['p50_ns'] / 1e3:.1f}us "
-                f"p99 {client['rtt']['p99_ns'] / 1e3:.1f}us p99.9 {client['rtt']['p999_ns'] / 1e3:.1f}us, "
-                f"svc p99 {srv['service']['p99_ns'] / 1e3:.2f}us, lost {client['lost_pct']:.3f}%, "
-                f"irqs {sysd['nic_irqs_total']} ({sysd['nic_irqs_on_target_pct']}% on target)")
+            log(f"[{n}/{len(plan)}] rep {rep} {load[1]} {s:11s}: {workload.log_line(rec)}, "
+                f"NIC irqs {sysd['nic_irqs_total']} ({sysd['nic_irqs_on_target_pct']}% on target)")
             if irq_cpus is not None and sysd["nic_irqs_on_target_pct"] is not None \
                     and sysd["nic_irqs_on_target_pct"] < 95:
                 warn("fewer than 95% of NIC interrupts hit the intended CPUs; is something rewriting affinity?")
@@ -781,112 +915,11 @@ def cmd_run(args):
 # --------------------------------------------------------------------------- #
 # report
 
-METRICS = [
-    ("achieved_rps", lambda r: r["client"]["achieved_rps"], "rps", 1, "higher"),
-    ("rtt_p50_us", lambda r: r["client"]["rtt"]["p50_ns"] / 1e3, "p50 us", 1, "lower"),
-    ("rtt_p99_us", lambda r: r["client"]["rtt"]["p99_ns"] / 1e3, "p99 us", 1, "lower"),
-    ("rtt_p999_us", lambda r: r["client"]["rtt"]["p999_ns"] / 1e3, "p99.9 us", 1, "lower"),
-    ("svc_p50_us", lambda r: r["server"]["service"]["p50_ns"] / 1e3, "svc p50 us", 2, "lower"),
-    ("svc_p99_us", lambda r: r["server"]["service"]["p99_ns"] / 1e3, "svc p99 us", 2, "lower"),
-    ("lost_pct", lambda r: r["client"]["lost_pct"], "lost %", 3, "lower"),
-    ("app_busy_pct", lambda r: r["system"]["app_cpus"].get("busy", 0), "app busy %", 1, None),
-    ("app_irq_soft_pct", lambda r: r["system"]["app_cpus"].get("irq", 0)
-     + r["system"]["app_cpus"].get("softirq", 0), "app irq+sirq %", 1, None),
-    ("irqs_on_target_pct", lambda r: r["system"]["nic_irqs_on_target_pct"] or 0, "IRQs on tgt %", 1, None),
-    ("allowance_exceeded", lambda r: sum(v for k, v in r.get("nic_stats", {}).items()
-                                         if "allowance_exceeded" in k), "AWS shaped", 0, None),
-]
-
-
 def report(outdir):
-    with open(os.path.join(outdir, "runs.jsonl")) as f:
-        runs = [json.loads(l) for l in f if l.strip()]
-    groups = {}
-    for r in runs:
-        groups.setdefault((r["server_mode"], r["rate"], r["scenario"]), []).append(r)
-
-    rows = []
-    for (mode, rate, scen), rs in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1],
-                                                                          SCENARIOS.index(kv[0][2]))):
-        row = {"server_mode": mode, "rate": rate, "scenario": scen, "reps": len(rs)}
-        for key, fn, _, _, _ in METRICS:
-            vals = [fn(r) for r in rs]
-            row[key] = statistics.median(vals)
-            row[key + "_min"] = min(vals)
-            row[key + "_max"] = max(vals)
-        rows.append(row)
-
-    with open(os.path.join(outdir, "summary.csv"), "w") as f:
-        cols = list(rows[0].keys())
-        f.write(",".join(cols) + "\n")
-        for row in rows:
-            f.write(",".join(str(round(row[c], 4)) if isinstance(row[c], float) else str(row[c])
-                             for c in cols) + "\n")
-
-    lines = [f"# irqbench results: {os.path.basename(os.path.abspath(outdir))}", ""]
-    meta_path = os.path.join(outdir, "meta.json")
-    if os.path.exists(meta_path):
-        meta = json.load(open(meta_path))
-        a = meta["args"]
-        lines += [f"- host `{meta['system']['hostname']}`, kernel `{meta['system']['kernel']}`, "
-                  f"{meta['system']['cpu_model']}",
-                  f"- iface `{a['iface']}` NICs {meta['system']['nics']}",
-                  f"- app cpus `{fmt_cpulist(meta['app_cpus'])}`, irq cpus `{fmt_cpulist(meta['irq_cpus'])}`, "
-                  f"proto {a['proto']}, server {a['server_mode']}, work {a['work_lines']} lines / "
-                  f"{a['wss_kb']} KiB, rps={a['rps']}, cpu-steer={a.get('cpu_steer')}, "
-                  f"channels={a.get('channels') or 'as found'}, peer {a['peer']}",
-                  f"- AWS {meta['system'].get('aws') or 'n/a'}",
-                  f"- {a['reps']} reps x {a['duration']}s; values are medians across reps (rate 0 = closed loop)", ""]
+    sys.path.insert(0, HERE)
+    import irqreport
+    print(irqreport.write_summary(outdir))
     try:
-        sys.path.insert(0, HERE)
-        import irqreport
-        lines += [irqreport.scenario_markdown(runs, json.load(open(meta_path)) if os.path.exists(meta_path) else {}),
-                  "## Results", ""]
-    except Exception as e:
-        warn(f"scenario explanations skipped: {e}")
-    hdr = ["mode", "rate", "scenario"] + [m[2] for m in METRICS]
-    lines.append("| " + " | ".join(hdr) + " |")
-    lines.append("|" + "---|" * len(hdr))
-    for row in rows:
-        vals = [row["server_mode"], f"{row['rate']:g}", row["scenario"]]
-        vals += [f"{row[k]:.{d}f}" for k, _, _, d, _ in METRICS]
-        lines.append("| " + " | ".join(vals) + " |")
-
-    lines += ["", "## each scenario vs same", "",
-              "Δ is relative to `same`. **clear** = the reps' min..max ranges do not overlap.", ""]
-    lines.append("| mode | rate | compare | rps Δ | p50 Δ | p99 Δ | p99.9 Δ | svc p99 Δ | winner at p99 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
-    idx = {(r["server_mode"], r["rate"], r["scenario"]): r for r in rows}
-    for (mode, rate, scen), row in sorted(idx.items()):
-        if scen in ("same", "default") or (mode, rate, "same") not in idx:
-            continue
-        base = idx[(mode, rate, "same")]
-
-        def delta(k):
-            if not base[k]:
-                return "n/a"
-            d = 100.0 * (row[k] - base[k]) / base[k]
-            clear = min(row["reps"], base["reps"]) >= 2 and (
-                row[k + "_min"] > base[k + "_max"] or row[k + "_max"] < base[k + "_min"])
-            return f"{d:+.1f}%" + (" **clear**" if clear else "")
-
-        if min(row["reps"], base["reps"]) < 2:
-            better = "need >=2 reps"
-        elif row["rtt_p99_us_max"] < base["rtt_p99_us_min"]:
-            better = scen
-        elif row["rtt_p99_us_min"] > base["rtt_p99_us_max"]:
-            better = "same"
-        else:
-            better = "no clear difference"
-        lines.append(f"| {mode} | {rate:g} | {scen} vs same | {delta('achieved_rps')} | {delta('rtt_p50_us')} | "
-                     f"{delta('rtt_p99_us')} | {delta('rtt_p999_us')} | {delta('svc_p99_us')} | {better} |")
-    md = "\n".join(lines) + "\n"
-    with open(os.path.join(outdir, "summary.md"), "w") as f:
-        f.write(md)
-    print(md)
-    try:
-        sys.path.insert(0, HERE)
-        import irqreport
         irqreport.build(outdir)
     except Exception as e:  # the markdown/CSV summary is still usable
         warn(f"HTML/PNG report failed: {e}")
@@ -943,15 +976,19 @@ def main():
 
     r = sub.add_parser("run", help="run the benchmark matrix")
     r.add_argument("--iface", required=True, help="interface the benchmark traffic uses (bond/vlan ok)")
-    r.add_argument("--app-cpus", required=True, help="CPUs for server threads, e.g. 2-3")
+    r.add_argument("--workload", choices=("rpc", "app"), default="rpc",
+                   help="rpc = synthetic request/response (default); app = your application on pinned "
+                        "cores receiving a one-way feed")
+    r.add_argument("--app-cpus", help="CPUs of the application / server threads, e.g. 2-3 "
+                                      "('auto' = read from a running app's thread affinities)")
     r.add_argument("--irq-cpus", required=True, help="dedicated IRQ CPUs for 'separate', e.g. 4-5")
     r.add_argument("--peer", default="local",
                    help="where the load generator runs: 'local' (loopback smoke test) or ssh:[user@]host")
     r.add_argument("--deploy", action="store_true", help="copy and build rpcbench on the peer first")
     r.add_argument("--server-addr", help="address the peer connects to (default: iface IPv4)")
     r.add_argument("--scenarios", default="default,same,separate,same-wide")
-    r.add_argument("--rates", default="10000,50000,0",
-                   help="comma list of total req/s (open loop); 0 = closed loop")
+    r.add_argument("--rates", help="rpc: total req/s, 0 = closed loop (default 10000,50000,0). app: feed "
+                                   "msgs/s, or pcap speed multipliers like 1x,2x, or top")
     r.add_argument("--reps", type=int, default=5)
     r.add_argument("--duration", type=float, default=10)
     r.add_argument("--warmup", type=float, default=2)
@@ -978,6 +1015,53 @@ def main():
     r.add_argument("--irq-filter", help="regex on /proc/interrupts name to select IRQs")
     r.add_argument("--stop-irqbalance", action="store_true")
     r.add_argument("--port", type=int, default=9000)
+    g = r.add_argument_group("app workload (--workload app)")
+    g.add_argument("--app-cmd", help="start the app per scenario: shell command with placeholders "
+                                     "{cpus} {ncpus} {cpu0} {port} {stats} {bin} {outdir}")
+    g.add_argument("--app-stop-cmd", help="command to stop it (default: SIGTERM to its process group)")
+    g.add_argument("--app-pid", type=int, help="attach to this running app instead (kept running)")
+    g.add_argument("--app-match", help="attach to the oldest process whose command line matches this regex")
+    g.add_argument("--app-ready", help="readiness: tcp:[HOST:]PORT, udp:PORT, file:PATH, log:REGEX, "
+                                       "cmd:COMMAND or delay:SECONDS (default delay:2)")
+    g.add_argument("--app-ready-timeout", type=float, default=60)
+    g.add_argument("--app-stats-file", help="stats file of a builtin feed handler you attach to")
+    g.add_argument("--feed", default="builtin",
+                   help="builtin | pcap:FILE | cmd:'COMMAND {host} {port} {rate} {duration}' | live")
+    g.add_argument("--feed-dest", help="where the feed is sent: DUT address or multicast group "
+                                       "(default: --server-addr)")
+    g.add_argument("--feed-port", type=int, default=9100)
+    g.add_argument("--feed-size", type=int, default=64, help="builtin: message size in bytes")
+    g.add_argument("--feed-burst", type=int, default=1, help="builtin: messages per burst")
+    g.add_argument("--feed-flows", type=int, default=4, help="builtin: source ports (RSS flows)")
+    g.add_argument("--feed-payload", help="builtin: file (on the peer) sent as every message")
+    g.add_argument("--feed-ts-offset", type=int, help="offset of the u64 CLOCK_REALTIME send timestamp in "
+                                                      "each message (builtin default 8)")
+    g.add_argument("--feed-mcast-if", help="builtin: local address the peer sends multicast from")
+    g.add_argument("--feed-cpus", help="CPU for the publisher on the peer")
+    g.add_argument("--peer-iface", help="pcap: peer interface to replay on (default: route to the DUT)")
+    g.add_argument("--peer-ip", help="pcap: peer source IP (default: from the route)")
+    g.add_argument("--pcap-rewrite", default="auto",
+                   help="auto (rewrite src/dst IP and MACs for this pair of hosts), none, or raw tcprewrite args")
+    g.add_argument("--pcap-keep-dst", action="store_true", help="keep destination IPs (multicast captures)")
+    g.add_argument("--pcap-portmap", help="tcprewrite --portmap value, e.g. 0-65535:9100")
+    g.add_argument("--latency", default="none",
+                   help="builtin (rpcbench sub app) | ptp (passive one-way tap) | cmd:'COMMAND' | file:PATH | "
+                        "http(s)://URL | none")
+    g.add_argument("--latency-format", choices=("json", "prometheus"),
+                   help="format of app-reported latency (default json; prometheus for http with --latency-metric)")
+    g.add_argument("--latency-metric", help="prometheus histogram name (without _bucket)")
+    g.add_argument("--latency-labels", help="prometheus label filter, e.g. feed=A,side=bid")
+    g.add_argument("--latency-keys", help="json key paths, e.g. p50=stats.lat.p50,p99=stats.lat.p99")
+    g.add_argument("--latency-unit", help="unit of app values: ns|us|ms|s (json default ns, prometheus s)")
+    g.add_argument("--latency-reset-cmd", help="run at the start of each window (reset the app's stats)")
+    g.add_argument("--latency-dump-cmd", help="run before reading file: latency (make the app write it)")
+    g.add_argument("--tap-iface", help="ptp: interface to tap (default --iface)")
+    g.add_argument("--tap-cpu", type=int, help="ptp: housekeeping CPU for the tap (default: auto)")
+    g.add_argument("--calibrate", type=float, default=3,
+                   help="seconds of feed before the matrix to find the busiest NIC queues; their IRQs are "
+                        "placed first (0 = off)")
+    g.add_argument("--irq-map", help="'same' scenario: explicit queue:cpu pairs, e.g. 3:5,7:6, so each "
+                                     "queue's IRQ lands on the core of the thread that reads it")
     r.add_argument("--seed", type=int, default=1)
     r.add_argument("--out", help="results directory")
     r.add_argument("--bin", default=os.path.join(HERE, "rpcbench"))

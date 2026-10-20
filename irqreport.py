@@ -61,31 +61,82 @@ def allowance(r):
     return sum(v for k, v in r.get("nic_stats", {}).items() if "allowance_exceeded" in k)
 
 
-METRICS = {  # key: (label, accessor, decimals, better)
-    "rps": ("throughput (req/s)", lambda r: r["client"]["achieved_rps"], 0, "higher"),
-    "p50": ("RTT p50 (µs)", lambda r: r["client"]["rtt"]["p50_ns"] / 1e3, 1, "lower"),
-    "p99": ("RTT p99 (µs)", lambda r: r["client"]["rtt"]["p99_ns"] / 1e3, 1, "lower"),
-    "p999": ("RTT p99.9 (µs)", lambda r: r["client"]["rtt"]["p999_ns"] / 1e3, 1, "lower"),
-    "p9999": ("RTT p99.99 (µs)", lambda r: r["client"]["rtt"]["p9999_ns"] / 1e3, 1, "lower"),
-    "svc_p50": ("service p50 (µs)", lambda r: r["server"]["service"]["p50_ns"] / 1e3, 2, "lower"),
-    "svc_p99": ("service p99 (µs)", lambda r: r["server"]["service"]["p99_ns"] / 1e3, 2, "lower"),
-    "work_p99": ("work p99 (µs)", lambda r: r["server"]["work"]["p99_ns"] / 1e3, 2, "lower"),
-    "lost": ("loss (%)", lambda r: r["client"]["lost_pct"], 3, "lower"),
-    "app_busy": ("app cores busy (%)", lambda r: r["system"]["app_cpus"].get("busy", 0), 1, None),
-    "app_irqsoft": ("app cores irq+softirq (%)", lambda r: r["system"]["app_cpus"].get("irq", 0)
-                    + r["system"]["app_cpus"].get("softirq", 0), 1, None),
-    "irq_cores_busy": ("IRQ cores busy (%)", lambda r: r["system"]["irq_cpus"].get("busy", 0), 1, None),
-    "on_target": ("NIC IRQs on target (%)", lambda r: r["system"]["nic_irqs_on_target_pct"] or 0, 1, None),
-    "nivcsw": ("involuntary ctx switches", lambda r: sum(t["nivcsw"] for t in r["server"]["per_thread"]), 0, "lower"),
+def g(obj, *path):
+    """Safe nested get: None when any step is missing."""
+    for p in path:
+        if not isinstance(obj, dict) or obj.get(p) is None:
+            return None
+        obj = obj[p]
+    return obj
+
+
+def lat(r):
+    """The latency histogram of a run: app/feed latency, or the RPC client's RTT."""
+    return r.get("latency") or g(r, "client", "rtt")
+
+
+def lat_us(key):
+    return lambda r: (lat(r) or {}).get(key) / 1e3 if (lat(r) or {}).get(key) is not None else None
+
+
+def throughput(r):
+    return g(r, "client", "achieved_rps") if "client" in r else g(r, "feed", "rx_msgs_per_s")
+
+
+def nivcsw(r):
+    if "server" in r:
+        return sum(t["nivcsw"] for t in r["server"]["per_thread"])
+    return g(r, "app", "nivcsw")
+
+
+def work_p99(r):
+    w = g(r, "server", "work") or g(r, "latency", "work")
+    return w["p99_ns"] / 1e3 if w and w.get("count") else None
+
+
+METRICS = {  # key: (label or {workload: label}, accessor, decimals, better)
+    "rps": ({"rpc": "throughput (req/s)", "app": "messages received (msg/s)"}, throughput, 0, "higher"),
+    "p50": ({"rpc": "RTT p50 (µs)", "app": "latency p50 (µs)"}, lat_us("p50_ns"), 1, "lower"),
+    "p90": ({"rpc": "RTT p90 (µs)", "app": "latency p90 (µs)"}, lat_us("p90_ns"), 1, "lower"),
+    "p99": ({"rpc": "RTT p99 (µs)", "app": "latency p99 (µs)"}, lat_us("p99_ns"), 1, "lower"),
+    "p999": ({"rpc": "RTT p99.9 (µs)", "app": "latency p99.9 (µs)"}, lat_us("p999_ns"), 1, "lower"),
+    "p9999": ({"rpc": "RTT p99.99 (µs)", "app": "latency p99.99 (µs)"}, lat_us("p9999_ns"), 1, "lower"),
+    "max": ({"rpc": "RTT max (µs)", "app": "latency max (µs)"}, lat_us("max_ns"), 1, "lower"),
+    "svc_p50": ("service p50 (µs)", lambda r: g(r, "server", "service", "p50_ns") and r["server"]["service"]["p50_ns"] / 1e3, 2, "lower"),
+    "svc_p99": ("service p99 (µs)", lambda r: g(r, "server", "service", "p99_ns") and r["server"]["service"]["p99_ns"] / 1e3, 2, "lower"),
+    "work_p99": ("work p99 (µs)", work_p99, 2, "lower"),
+    "lost": ("loss (%)", lambda r: g(r, "client", "lost_pct"), 3, "lower"),
+    "drops": ("dropped packets", lambda r: g(r, "feed", "drops_total"), 0, "lower"),
+    "gaps": ("sequence gaps", lambda r: g(r, "feed", "gaps"), 0, "lower"),
+    "app_ints": ("interrupts / s per app core", lambda r: g(r, "interference", "ints_per_cpu_s"), 0, "lower"),
+    "app_nic_ints": ("NIC interrupts / s per app core", lambda r: g(r, "interference", "nic_ints_per_cpu_s"), 0, "lower"),
+    "app_other_ints": ("other interrupts / s per app core", lambda r: g(r, "interference", "other_ints_per_cpu_s"), 0, "lower"),
+    "app_netrx": ("NET_RX softirqs / s per app core", lambda r: g(r, "interference", "net_rx_softirqs_per_cpu_s"), 0, "lower"),
+    "app_busy": ("app cores busy (%)", lambda r: g(r, "system", "app_cpus", "busy"), 1, None),
+    "app_irqsoft": ("app cores irq+softirq (%)", lambda r: (g(r, "system", "app_cpus", "irq") or 0)
+                    + (g(r, "system", "app_cpus", "softirq") or 0), 2, "lower"),
+    "irq_cores_busy": ("IRQ cores busy (%)", lambda r: g(r, "system", "irq_cpus", "busy"), 1, None),
+    "on_target": ("NIC IRQs on target (%)", lambda r: g(r, "system", "nic_irqs_on_target_pct"), 1, None),
+    "nivcsw": ("involuntary ctx switches", nivcsw, 0, "lower"),
+    "wait_us": ("app run-queue wait (µs)", lambda r: g(r, "app", "wait_us"), 1, "lower"),
     "shaped": ("AWS allowance exceeded", allowance, 0, "lower"),
 }
+LOAD_LABELS = {}
+
+
+def mlabel(key, workload="rpc"):
+    lbl = METRICS[key][0]
+    return lbl.get(workload, lbl.get("rpc")) if isinstance(lbl, dict) else lbl
 
 
 class Data:
     def __init__(self, runs, meta):
         self.runs, self.meta = runs, meta
+        self.workload = meta.get("workload") or (runs[0].get("workload") if runs else None) or "rpc"
         self.groups = {}
         for r in runs:
+            if r.get("load_label"):
+                LOAD_LABELS[r["rate"]] = r["load_label"]
             self.groups.setdefault((r["server_mode"], r["rate"], r["scenario"]), []).append(r)
         self.modes = sorted({k[0] for k in self.groups})
         present = {k[2] for k in self.groups}
@@ -93,6 +144,8 @@ class Data:
 
     def rates(self, mode, closed=None):
         rs = sorted({k[1] for k in self.groups if k[0] == mode})
+        if self.workload == "app":  # rate 0 is "max"/"live", not closed loop
+            return [] if closed is True else [r for r in rs if r > 0] + [r for r in rs if r == 0]
         if closed is True:
             return [r for r in rs if r == 0]
         if closed is False:
@@ -104,8 +157,28 @@ class Data:
         if not rs:
             return None
         fn = METRICS[metric][1] if isinstance(metric, str) else metric
-        vals = [fn(r) for r in rs]
+        vals = []
+        for r in rs:
+            try:
+                v = fn(r)
+            except (KeyError, TypeError, ZeroDivisionError):
+                v = None
+            if v is not None:
+                vals.append(v)
+        if not vals:
+            return None
         return statistics.median(vals), min(vals), max(vals), len(vals)
+
+    def has(self, metric):
+        return any(self.stat(*k, metric) for k in self.groups)
+
+    def label(self, key):
+        return mlabel(key, self.workload)
+
+    @property
+    def primary(self):
+        """The metric findings are based on: p99 latency if we have it, else interrupts on app cores."""
+        return "p99" if self.has("p99") else "app_ints" if self.has("app_ints") else "app_irqsoft"
 
     def compare(self, mode, rate, scen, metric, base="same"):
         """(delta %, clear?) of scen vs base; clear = rep ranges don't overlap (>=2 reps)."""
@@ -118,6 +191,8 @@ class Data:
 
 
 def fmt_rate(rate):
+    if rate in LOAD_LABELS:
+        return LOAD_LABELS[rate]
     if rate == 0:
         return "closed loop"
     for div, suf in ((1e6, "M"), (1e3, "K")):
@@ -152,15 +227,26 @@ def charts(data, outdir):
     made = []
     for mode in data.modes:
         suffix = f"-{mode}" if len(data.modes) > 1 else ""
-        builders = [
-            ("latency-vs-load", f"Client latency vs offered load ({mode} server)", chart_latency_vs_load),
-            ("throughput", f"Maximum throughput, closed loop ({mode} server)", chart_throughput),
-            ("delta-vs-same", f"Change vs `same` ({mode} server)", chart_delta),
-            ("percentile-spectrum", f"Latency percentile spectrum ({mode} server)", chart_spectrum),
-            ("service-time", f"Server service time ({mode} server)", chart_service),
-            ("cpu-accounting", f"Where CPU time went ({mode} server)", chart_cpu),
-            ("irq-placement", f"Where NIC interrupts landed ({mode} server)", chart_irq_placement),
-        ]
+        if data.workload == "app":
+            builders = [
+                ("latency-vs-load", f"Latency vs feed rate ({mode})", chart_latency_vs_load),
+                ("delta-vs-same", f"Change vs `same` ({mode})", chart_delta),
+                ("percentile-spectrum", f"Latency percentile spectrum ({mode})", chart_spectrum),
+                ("interference", f"Interference on the app cores ({mode})", chart_interference),
+                ("drops", f"Drops and sequence gaps ({mode})", chart_drops),
+                ("app-threads", f"App threads: CPU time and scheduling ({mode})", chart_app_threads),
+                ("irq-placement", f"Where NIC interrupts landed ({mode})", chart_irq_placement),
+            ]
+        else:
+            builders = [
+                ("latency-vs-load", f"Client latency vs offered load ({mode} server)", chart_latency_vs_load),
+                ("throughput", f"Maximum throughput, closed loop ({mode} server)", chart_throughput),
+                ("delta-vs-same", f"Change vs `same` ({mode} server)", chart_delta),
+                ("percentile-spectrum", f"Latency percentile spectrum ({mode} server)", chart_spectrum),
+                ("service-time", f"Server service time ({mode} server)", chart_service),
+                ("cpu-accounting", f"Where CPU time went ({mode} server)", chart_cpu),
+                ("irq-placement", f"Where NIC interrupts landed ({mode} server)", chart_irq_placement),
+            ]
         for name, title, fn in builders:
             ok = False
             for theme in ("light", "dark"):
@@ -190,6 +276,14 @@ CAPTIONS = {
                     "It rises when interrupts steal cycles or pollute cache on the app cores.",
     "cpu-accounting": "Average across the app cores (/proc/stat deltas). `irq+softirq` is kernel "
                       "network work that ran on the application's cores.",
+    "interference": "Averaged per app core over the measurement window, from /proc/interrupts and "
+                    "/proc/softirqs. Every interrupt on an isolated, busy-polling core stalls the "
+                    "feed-handler thread. `other` is everything that isn't the NIC (timer, IPIs, ...).",
+    "drops": "UDP receive-buffer errors and NIC drops in the window, plus sequence gaps where the "
+             "feed carries sequence numbers. For market data, any non-zero value is a missed update.",
+    "app-threads": "Summed over the app's busy threads (≥5% CPU): involuntary context switches and "
+                   "time spent runnable but waiting for a CPU (schedstat), both of which mean the thread "
+                   "was pushed off its core.",
     "irq-placement": "Share of NIC interrupts per CPU at the highest load. This checks that each "
                      "scenario put the interrupts where intended.",
 }
@@ -271,21 +365,90 @@ def series_lines(ax, data, mode, rates, metric, t):
 
 def chart_latency_vs_load(data, mode, t):
     rates = data.rates(mode, closed=False)
-    if not rates:
+    if not rates or not data.has("p99"):
         return None
     panels = [("p50", "p50"), ("p99", "p99"), ("p999", "p99.9")]
-    fig, axes = new_fig(t, len(panels), title="Round-trip latency vs offered load")
+    app = data.workload == "app"
+    fig, axes = new_fig(t, len(panels), title="Latency vs feed rate" if app else "Round-trip latency vs offered load")
     for ax, (m, label) in zip(axes[0], panels):
-        series_lines(ax, data, mode, rates, m, t)
-        load_axis(ax, rates)
-        style_axes(ax, t, xlabel="offered load (req/s)", ylabel="µs" if m == "p50" else None,
-                   title=f"RTT {label}")
+        series_cat(ax, data, mode, rates, m, t)
+        style_axes(ax, t, xlabel="feed rate" if app else "offered load (req/s)",
+                   ylabel="µs" if m == "p50" else None, title=f"{'latency' if app else 'RTT'} {label}")
+    legend(fig, data, t)
+    return finish(fig)
+
+
+def series_cat(ax, data, mode, rates, metric, t, ylim0=True):
+    """Lines per scenario over evenly spaced loads, median with min-max whiskers."""
+    xs = list(range(len(rates)))
+    for s in data.scenarios:
+        pts = [(x, data.stat(mode, r, s, metric)) for x, r in zip(xs, rates)]
+        pts = [(x, st) for x, st in pts if st]
+        if not pts:
+            continue
+        c = t["series"][s]
+        ax.errorbar([x for x, _ in pts], [st[0] for _, st in pts],
+                    yerr=[[st[0] - st[1] for _, st in pts], [st[2] - st[0] for _, st in pts]],
+                    color=c, linewidth=2, marker=MARKERS[s], markersize=7, markeredgecolor=t["surface"],
+                    markeredgewidth=1.5, elinewidth=1, capsize=0, zorder=3 if s != "default" else 2)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([fmt_rate(r) for r in rates])
+    if len(xs) == 1:
+        ax.set_xlim(-0.5, 0.5)
+    if ylim0:
+        ax.set_ylim(bottom=0)
+
+
+def chart_interference(data, mode, t):
+    rates = data.rates(mode)
+    if not rates or not data.has("app_ints"):
+        return None
+    panels = [("app_ints", "all interrupts / s / core"), ("app_nic_ints", "NIC interrupts / s / core"),
+              ("app_netrx", "NET_RX softirqs / s / core"), ("app_irqsoft", "irq + softirq time (%)")]
+    fig, axes = new_fig(t, len(panels), w=3.7, title="Interference on the application cores")
+    for ax, (m, label) in zip(axes[0], panels):
+        series_cat(ax, data, mode, rates, m, t)
+        ax.yaxis.set_major_formatter(compact)
+        style_axes(ax, t, xlabel="feed rate", title=label)
+    legend(fig, data, t)
+    return finish(fig)
+
+
+def chart_drops(data, mode, t):
+    rates = data.rates(mode)
+    panels = [(m, data.label(m)) for m in ("drops", "gaps") if data.has(m)]
+    if not rates or not panels or not any_nonzero(data, ("drops", "gaps")):
+        return None
+    fig, axes = new_fig(t, len(panels), w=4.6, title="Dropped packets and sequence gaps (lower is better)")
+    for ax, (m, label) in zip(axes[0], panels):
+        series_cat(ax, data, mode, rates, m, t)
+        ax.yaxis.set_major_formatter(compact)
+        style_axes(ax, t, xlabel="feed rate", title=f"{label} per window")
+    legend(fig, data, t)
+    return finish(fig)
+
+
+def any_nonzero(data, metrics):
+    return any(METRICS[m][1](r) for r in data.runs for m in metrics if data.has(m))
+
+
+def chart_app_threads(data, mode, t):
+    rates = data.rates(mode)
+    panels = [(m, lbl) for m, lbl in (("nivcsw", "involuntary context switches"),
+                                       ("wait_us", "run-queue wait (µs)"), ("app_busy", "app cores busy (%)"))
+              if data.has(m)]
+    if not rates or not panels:
+        return None
+    fig, axes = new_fig(t, len(panels), title="Application threads on their cores")
+    for ax, (m, label) in zip(axes[0], panels):
+        series_cat(ax, data, mode, rates, m, t)
+        style_axes(ax, t, xlabel="feed rate", title=label)
     legend(fig, data, t)
     return finish(fig)
 
 
 def chart_throughput(data, mode, t):
-    if not data.rates(mode, closed=True):
+    if data.workload != "rpc" or not data.rates(mode, closed=True):
         return None
     scen = [s for s in data.scenarios if data.stat(mode, 0, s, "rps")]
     fig, axes = new_fig(t, 2, w=5.2, h=0.55 * len(scen) + 1.4, title="Closed loop: maximum throughput and tail latency")
@@ -326,7 +489,14 @@ def chart_delta(data, mode, t):
     if "same" not in data.scenarios or not others or not rates:
         return None
     import numpy as np
-    panels = [("p99", "RTT p99"), ("p999", "RTT p99.9"), ("rps", "throughput")]
+    if data.workload == "app":
+        cands = [("p99", "latency p99"), ("p999", "latency p99.9"), ("app_ints", "interrupts on app cores"),
+                 ("drops", "dropped packets")]
+    else:
+        cands = [("p99", "RTT p99"), ("p999", "RTT p99.9"), ("rps", "throughput")]
+    panels = [(m, lbl) for m, lbl in cands if data.has(m)][:3]
+    if not panels:
+        return None
     fig, axes = new_fig(t, len(panels), w=0.9 * len(rates) + 2.6, h=0.5 * len(others) + 1.6,
                         title="Each scenario vs same (blue = better, red = worse)")
     cmap = diverging_cmap(t)
@@ -368,7 +538,7 @@ def chart_delta(data, mode, t):
 
 def chart_spectrum(data, mode, t):
     rates = data.rates(mode)
-    if not rates:
+    if not rates or not data.has("p99"):
         return None
     ncols = min(3, len(rates))
     nrows = math.ceil(len(rates) / ncols)
@@ -379,7 +549,7 @@ def chart_spectrum(data, mode, t):
         for s in data.scenarios:
             ys = []
             for key, _, _ in SPECTRUM:
-                st = data.stat(mode, r, s, lambda run, key=key: run["client"]["rtt"][key] / 1e3)
+                st = data.stat(mode, r, s, lambda run, key=key: (lat(run) or {}).get(key) and lat(run)[key] / 1e3)
                 ys.append(st[0] if st else None)
             if all(y is None for y in ys):
                 continue
@@ -393,7 +563,7 @@ def chart_spectrum(data, mode, t):
         ax.set_xticks(xs)
         ax.set_xticklabels([lbl for _, lbl, _ in SPECTRUM])
         style_axes(ax, t, ylabel="µs (log)" if k % ncols == 0 else None,
-                   title=f"load {fmt_rate(r)}" if r else "closed loop")
+                   title=f"load {fmt_rate(r)}" if (r or data.workload == "app") else "closed loop")
     for k in range(len(rates), nrows * ncols):
         axes[k // ncols][k % ncols].set_visible(False)
     legend(fig, data, t)
@@ -543,7 +713,8 @@ def scenario_info(runs, meta):
                          "protocol processing runs there too.",
                "off": "RPS is off: the NIC's RSS spreads flows across its queues in hardware.",
                "keep": "RPS is left as it was found."}.get(rps, "")
-    steer = a.get("cpu_steer", False)
+    app_mode = meta.get("workload") == "app"
+    steer = a.get("cpu_steer", False) and not app_mode
     by_scen = {}
     for r in runs:
         by_scen.setdefault(r["scenario"], []).append(r)
@@ -623,6 +794,22 @@ def scenario_info(runs, meta):
                 cons="The sibling still competes for the core's execution units and cache, so it isolates "
                      "less than `separate`.",
                 irq_cpus=ic or [])
+        if app_mode:
+            for k in ("setup", "pros", "cons", "question"):
+                info[k] = (info[k].replace("Server threads are pinned to", "The application's threads run on")
+                           .replace("Server threads and NIC interrupts are both on", "The application and the NIC interrupts are both on")
+                           .replace("Server threads are on", "The application's threads are on")
+                           .replace("one server thread per CPU", "the application started on all of them")
+                           .replace("more server threads", "more application threads"))
+            if meta.get("app_lifecycle") != "restart":
+                info["setup"] += " The application keeps running throughout; only the interrupts move."
+            if name == "same":
+                info["cons"] += (" On isolated cores this deliberately breaks the isolation: every NIC interrupt "
+                                 "stalls a busy-polling feed-handler thread while it runs.")
+                info["pros"] += (" On isolated cores the packet is processed on the core whose thread reads it, "
+                                 "provided the busiest queue's IRQ lands on the right core (see --irq-map).")
+            if name == "separate":
+                info["pros"] += " The isolated cores see only the feed handler, which is what isolcpus is for."
         info.update(name=name, server_cpus=srv)
         out.append(info)
     return out
@@ -666,21 +853,22 @@ def scenario_markdown(runs, meta):
 
 def findings(data):
     out = []
+    m = data.primary
     for mode in data.modes:
         for r in data.rates(mode):
             row = []
             best = None
             for s in data.scenarios:
-                st = data.stat(mode, r, s, "p99")
+                st = data.stat(mode, r, s, m)
                 if st and (best is None or st[0] < best[1][0]):
                     best = (s, st)
             if not best:
                 continue
             for s in ("separate", "same-wide", "smt-sibling", "default"):
-                c = data.compare(mode, r, s, "p99")
+                c = data.compare(mode, r, s, m)
                 if c:
                     row.append((s, c[0], c[1]))
-            out.append({"mode": mode, "rate": r, "best": best[0], "best_p99": best[1][0], "vs_same": row})
+            out.append({"mode": mode, "rate": r, "best": best[0], "best_val": best[1][0], "vs_same": row})
     return out
 
 
@@ -688,15 +876,31 @@ def warnings_for(data):
     out = []
     for r in data.runs:
         tag = f"rep {r['rep']}, {fmt_rate(r['rate'])}, {r['scenario']} ({r['server_mode']})"
+        if g(r, "app", "exited_threads"):
+            out.append(("warning", f"{tag}: {r['app']['exited_threads']} app threads exited during the window"))
         if allowance(r):
             out.append(("serious", f"{tag}: AWS network allowance exceeded "
                         f"({allowance(r)}), so the instance was shaped"))
         tgt = r["system"].get("nic_irqs_on_target_pct")
         if r.get("irq_cpus") is not None and tgt is not None and tgt < 95:
             out.append(("warning", f"{tag}: only {tgt:.1f}% of NIC interrupts hit the intended CPUs"))
-        if r["client"]["lost_pct"] > 0.1:
+        if (g(r, "client", "lost_pct") or 0) > 0.1:
             out.append(("warning", f"{tag}: {r['client']['lost_pct']:.2f}% requests lost"))
-        lag = r["client"].get("max_sched_lag_ns", 0)
+        if g(r, "feed", "drops_total"):
+            out.append(("serious", f"{tag}: {r['feed']['drops_total']} packets dropped "
+                        f"({ {k: v for k, v in r['feed']['drops'].items() if v} })"))
+        if g(r, "feed", "gaps"):
+            out.append(("serious", f"{tag}: {r['feed']['gaps']} sequence gaps (missed messages)"))
+        neg = g(r, "latency", "extra", "negative_latency")
+        if neg:
+            out.append(("warning", f"{tag}: {neg} messages had a receive time before the send time; "
+                        "the hosts' clocks are not in sync, so one-way latency is unreliable"))
+        if g(r, "latency", "error"):
+            out.append(("warning", f"{tag}: latency source error: {r['latency']['error']}"))
+        if r.get("workload") == "app" and r.get("latency") is None and data.meta.get(
+                "latency_source", {}).get("kind") not in (None, "none"):
+            out.append(("warning", f"{tag}: no latency data returned for this window"))
+        lag = g(r, "client", "max_sched_lag_ns") or g(r, "feed", "publisher", "max_sched_lag_ns") or 0
         if r["rate"] > 0 and lag > 1e6:
             out.append(("warning", f"{tag}: the load generator fell {lag / 1e6:.1f} ms behind schedule, "
                         "so it may be the bottleneck"))
@@ -705,6 +909,37 @@ def warnings_for(data):
     if data.meta.get("args", {}).get("peer") == "local":
         out.insert(0, ("serious", "peer=local: loopback traffic never raises NIC interrupts. "
                        "These results validate the tooling only, not IRQ placement."))
+    if data.workload == "app":
+        iso = data.meta.get("isolation", {})
+        isolated = set(cpulist(iso.get("isolated", "")))
+        app = set(data.meta.get("app_cpus", []))
+        if app and not app <= isolated:
+            out.append(("warning", f"app CPUs {cpus_str(sorted(app - isolated))} are not in isolcpus "
+                        f"(isolated: {iso.get('isolated') or 'none'}); other tasks may run there"))
+        if data.meta.get("latency_source", {}).get("kind") in ("ptp", "builtin") and \
+                data.meta.get("args", {}).get("peer") != "local":
+            for side, c in (data.meta.get("clock") or {}).items():
+                off = c.get("offset_s")
+                if off is None:
+                    out.append(("warning", f"clock sync on {side} unknown (chronyc not available); "
+                                "one-way latency depends on it"))
+                elif abs(off) > 20e-6:
+                    out.append(("serious", f"{side} clock is {off * 1e6:+.1f} µs off its reference; one-way "
+                                "latency carries that error"))
+    for s, why in (data.meta.get("skipped_scenarios") or {}).items():
+        out.append(("warning", f"scenario {s} was not run: {why}"))
+    return out
+
+
+def cpulist(s):
+    out = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-")
+            out.extend(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            out.append(int(part))
     return out
 
 
@@ -839,8 +1074,19 @@ def build_html(data, outdir, made, embed=True):
                  "or just from more cores.</p><div class='tablewrap'><table><thead><tr><th class='l'>If you see"
                  f"</th><th class='l'>It means</th></tr></thead><tbody>{guide}</tbody></table></div></div>")
 
+    if data.workload == "app":
+        ls = meta.get("latency_source") or {}
+        parts.append(f"<div class='card'><h3>What “latency” means in this run</h3><p><b>{esc(ls.get('kind'))}</b>: "
+                     f"{esc(ls.get('meaning'))}</p><p class='sub'>Feed: {esc((meta.get('feed') or {}).get('describe'))}. "
+                     "Drops, sequence gaps and interrupts on the app cores are measured in every run, whatever "
+                     "the latency source.</p></div>")
+
     # findings
-    parts.append("<h2 id='findings'>Findings</h2><p class='sub'>Based on client p99 round-trip latency. "
+    pm = data.primary
+    basis = {"p99": "p99 latency" if data.workload == "app" else "client p99 round-trip latency",
+             "app_ints": "interrupts per second on the app cores (no latency source was configured)",
+             "app_irqsoft": "irq+softirq time on the app cores"}[pm]
+    parts.append(f"<h2 id='findings'>Findings</h2><p class='sub'>Based on {esc(basis)}. "
                  "A result is <b>clear</b> when the repetitions' min–max ranges don't overlap.</p><div class='grid'>")
     for f in findings(data):
         rows = []
@@ -850,11 +1096,19 @@ def build_html(data, outdir, made, embed=True):
             rows.append(f"<div><span class='swatch' style='background:{T[s]}'></span>{esc(s)} vs same: "
                         f"<b class='{cls}'>{d:+.1f}%</b> <span class='muted'>"
                         f"{'clear, ' + word if clear else 'within noise'}</span></div>")
-        parts.append(f"<div class='card tile'><div class='label'>{esc(f['mode'])} server · load "
+        unit = "µs" if pm == "p99" else "/s per core" if pm == "app_ints" else "%"
+        parts.append(f"<div class='card tile'><div class='label'>{esc(f['mode'])} · load "
                      f"{esc(fmt_rate(f['rate']))}</div><div class='value'>"
                      f"<span class='swatch' style='background:{T[f['best']]}'></span>{esc(f['best'])}</div>"
-                     f"<div class='muted'>lowest p99: {f['best_p99']:.1f} µs</div>{''.join(rows)}</div>")
+                     f"<div class='muted'>lowest {esc(data.label(pm))}: {fmt_num(f['best_val'], 1)} {unit}</div>"
+                     f"{''.join(rows)}</div>")
     parts.append("</div>")
+    if data.workload == "app" and data.has("drops"):
+        if any_nonzero(data, ("drops", "gaps")):
+            parts.append("<p class='bad'>⛔ Some runs dropped packets or missed sequence numbers. See the "
+                         "warnings above and the drops chart.</p>")
+        else:
+            parts.append("<p class='good'>✓ No packet drops or sequence gaps in any run.</p>")
 
     # charts
     parts.append("<h2 id='charts'>Charts</h2>")
@@ -873,12 +1127,11 @@ def build_html(data, outdir, made, embed=True):
                      f"<figcaption><b>{esc(c['title'])}.</b> {esc(c['caption'])}</figcaption></figure></div>")
 
     # summary table
-    keys = ["rps", "p50", "p99", "p999", "p9999", "svc_p50", "svc_p99", "work_p99", "lost",
-            "app_busy", "app_irqsoft", "irq_cores_busy", "on_target", "nivcsw", "shaped"]
+    keys = [k for k in summary_keys(data.workload) if data.has(k)]
     parts.append("<h2 id='summary'>Summary table</h2><p class='sub'>Median across repetitions, "
                  "with min–max below. Click a header to sort.</p><div class='card tablewrap'>"
                  "<table class='sortable'><thead><tr><th class='l'>mode</th><th>load</th><th class='l'>scenario</th>"
-                 "<th>reps</th>" + "".join(f"<th>{esc(METRICS[k][0])}</th>" for k in keys) +
+                 "<th>reps</th>" + "".join(f"<th>{esc(data.label(k))}</th>" for k in keys) +
                  "</tr></thead><tbody>")
     for mode in data.modes:
         for r in data.rates(mode):
@@ -888,7 +1141,11 @@ def build_html(data, outdir, made, embed=True):
                 cells = []
                 n = 0
                 for k in keys:
-                    med, lo, hi, n = data.stat(mode, r, s, k)
+                    st = data.stat(mode, r, s, k)
+                    if not st:
+                        cells.append("<td>–</td>")
+                        continue
+                    med, lo, hi, n = st
                     dec = METRICS[k][2]
                     rng = f"<div class='rng'>{fmt_num(lo, dec)}–{fmt_num(hi, dec)}</div>" if n > 1 and lo != hi else ""
                     cells.append(f"<td data-v='{med}'>{fmt_num(med, dec)}{rng}</td>")
@@ -900,7 +1157,7 @@ def build_html(data, outdir, made, embed=True):
     # comparison table
     parts.append("<h3 style='margin-top:20px'>Change vs <code>same</code></h3><div class='card tablewrap'>"
                  "<table class='sortable'><thead><tr><th class='l'>mode</th><th>load</th><th class='l'>scenario</th>"
-                 + "".join(f"<th>{esc(METRICS[k][0])} Δ</th>" for k in ("rps", "p50", "p99", "p999", "svc_p99"))
+                 + "".join(f"<th>{esc(data.label(k))} Δ</th>" for k in compare_keys(data))
                  + "</tr></thead><tbody>")
     for mode in data.modes:
         for r in data.rates(mode):
@@ -908,7 +1165,7 @@ def build_html(data, outdir, made, embed=True):
                 if s == "same":
                     continue
                 cells = []
-                for k in ("rps", "p50", "p99", "p999", "svc_p99"):
+                for k in compare_keys(data):
                     c = data.compare(mode, r, s, k)
                     if not c:
                         cells.append("<td>–</td>")
@@ -936,15 +1193,35 @@ def build_html(data, outdir, made, embed=True):
         ("Kernel", sysi.get("kernel")), ("Cmdline", sysi.get("cmdline")), ("Governors", sysi.get("governors")),
         ("NUMA", sysi.get("numa_nodes")), ("SMT active", sysi.get("smt_active")),
         ("App CPUs", fmt_cpus(meta.get("app_cpus", ""))), ("IRQ CPUs", fmt_cpus(meta.get("irq_cpus", ""))),
-        ("Interface", a.get("iface")), ("Peer", a.get("peer")), ("Protocol", a.get("proto")),
-        ("Server mode", a.get("server_mode")), ("CPU steering", a.get("cpu_steer")), ("RPS", a.get("rps")),
-        ("Channels", a.get("channels") or "as found"),
-        ("Work", f"{a.get('work_lines')} cache lines / {a.get('wss_kb')} KiB working set"),
-        ("Messages", f"{a.get('req_size')} B request / {a.get('resp_size')} B response"),
-        ("Load", f"{a.get('client_threads')} client threads × {a.get('conns')} sockets, "
-                 f"{'Poisson' if a.get('poisson') else 'uniform'} arrivals, closed-loop outstanding {a.get('outstanding')}"),
-        ("Timing", f"{a.get('reps')} reps × {a.get('duration')} s (+{a.get('warmup')} s warm-up), seed {a.get('seed')}"),
+        ("Interface", a.get("iface")), ("Peer", a.get("peer")),
+        ("RPS", a.get("rps")), ("Channels", a.get("channels") or "as found"),
     ]
+    if data.workload == "app":
+        iso = meta.get("isolation", {})
+        setup += [
+            ("Application", (f"restarted per scenario: {meta.get('app_cmd')}" if meta.get("app_lifecycle") == "restart"
+                             else f"kept running: pid {meta.get('app_pid')} ({meta.get('app_comm')})")),
+            ("Feed", (meta.get("feed") or {}).get("describe")),
+            ("Latency source", (meta.get("latency_source") or {}).get("kind")),
+            ("isolcpus / nohz_full", f"isolated: {iso.get('isolated') or 'none'} · nohz_full: "
+                                     f"{iso.get('nohz_full') or 'none'}"),
+            ("Kernel params", iso.get("cmdline_params") or "none of the usual isolation parameters"),
+            ("Sysctls", iso.get("sysctls")),
+            ("IRQ order", (meta.get("queue_calibration") or {}).get("irq_order", "queue-number order")),
+            ("Queue calibration", (meta.get("queue_calibration") or {}).get("rx_by_queue", "not run")),
+            ("Timing", f"{a.get('reps')} reps × {a.get('duration')} s window (+{a.get('warmup')} s warm-up), "
+                       f"seed {a.get('seed')}"),
+        ]
+    else:
+        setup += [
+            ("Protocol", a.get("proto")), ("Server mode", a.get("server_mode")),
+            ("CPU steering", a.get("cpu_steer")),
+            ("Work", f"{a.get('work_lines')} cache lines / {a.get('wss_kb')} KiB working set"),
+            ("Messages", f"{a.get('req_size')} B request / {a.get('resp_size')} B response"),
+            ("Load", f"{a.get('client_threads')} client threads × {a.get('conns')} sockets, "
+                     f"{'Poisson' if a.get('poisson') else 'uniform'} arrivals, closed-loop outstanding {a.get('outstanding')}"),
+            ("Timing", f"{a.get('reps')} reps × {a.get('duration')} s (+{a.get('warmup')} s warm-up), seed {a.get('seed')}"),
+        ]
     parts.append("<h2 id='setup'>Setup</h2><div class='card tablewrap'><table><tbody>" +
                  "".join(f"<tr><td class='l' style='width:160px'><b>{esc(k)}</b></td>"
                          f"<td class='l' style='white-space:normal'>{esc(v)}</td></tr>" for k, v in setup) +
@@ -953,6 +1230,17 @@ def build_html(data, outdir, made, embed=True):
         parts.append("<div class='card tablewrap'><table><thead><tr><th class='l'>device</th><th class='l'>driver</th>"
                      "<th>NUMA</th><th>rx queues</th><th class='l'>IRQs</th><th>Mb/s</th></tr></thead>"
                      f"<tbody>{nic_rows}</tbody></table></div>")
+    if data.workload == "app":
+        allowed = meta.get("irqs_allowed_on_app_cpus") or []
+        rows = "".join(f"<tr><td>{x['irq']}</td><td class='l'>{esc(x['name'])}</td><td class='l'>{esc(x['affinity'])}</td>"
+                       f"<td class='l'>{esc(x.get('effective') or '')}</td></tr>" for x in allowed)
+        parts.append(f"<details class='card'><summary>{len(allowed)} IRQs were allowed on the app CPUs before the run "
+                     "(anything here can interrupt them)</summary><div class='tablewrap'><table><thead><tr><th>IRQ</th>"
+                     "<th class='l'>name</th><th class='l'>affinity</th><th class='l'>effective</th></tr></thead>"
+                     f"<tbody>{rows}</tbody></table></div></details>")
+        if meta.get("clock"):
+            parts.append(f"<details class='card'><summary>Clocks (chrony / PTP)</summary><pre style='white-space:pre-wrap;"
+                         f"font-size:12px'>{esc(json.dumps(meta['clock'], indent=2))}</pre></details>")
     for d, n in nics.items():
         if n.get("ethtool_c"):
             parts.append(f"<details class='card'><summary>{esc(d)}: coalescing / channels / driver</summary>"
@@ -960,19 +1248,27 @@ def build_html(data, outdir, made, embed=True):
                          f"{esc(n.get('ethtool_l', ''))}\n{esc(n.get('ethtool_c', ''))}</pre></details>")
 
     # raw runs
+    cols = [("rps", 0), ("p50", 1), ("p99", 1), ("p999", 1), ("max", 1)]
+    cols += [("svc_p99", 2), ("lost", 3)] if data.workload == "rpc" else [("drops", 0), ("gaps", 0), ("app_ints", 0),
+                                                                          ("nivcsw", 0)]
+    cols = [(k, d) for k, d in cols if data.has(k)]
     parts.append("<h2 id='runs'>Raw runs</h2><details class='card'><summary>All "
                  f"{len(data.runs)} runs, in execution order</summary><div class='tablewrap'>"
                  "<table class='sortable'><thead><tr><th>#</th><th>rep</th><th>load</th><th class='l'>scenario</th>"
-                 "<th>rps</th><th>p50 µs</th><th>p99 µs</th><th>p99.9 µs</th><th>max µs</th><th>svc p99 µs</th>"
-                 "<th>loss %</th><th>NIC IRQs</th><th>on target %</th><th class='l'>IRQs by CPU</th></tr></thead><tbody>")
+                 + "".join(f"<th>{esc(data.label(k))}</th>" for k, _ in cols) +
+                 "<th>NIC IRQs</th><th>on target %</th><th class='l'>IRQs by CPU</th></tr></thead><tbody>")
     for i, r in enumerate(data.runs, 1):
-        c, sv, sy = r["client"], r["server"], r["system"]
+        sy = r["system"]
+        cells = []
+        for k, d in cols:
+            try:
+                v = METRICS[k][1](r)
+            except (KeyError, TypeError):
+                v = None
+            cells.append(f"<td data-v='{v if v is not None else -1}'>{fmt_num(v, d)}</td>")
         parts.append(
             f"<tr><td>{i}</td><td>{r['rep']}</td><td data-v='{r['rate'] or 1e18}'>{esc(fmt_rate(r['rate']))}</td>"
-            f"<td class='l'>{esc(r['scenario'])}</td><td data-v='{c['achieved_rps']}'>{c['achieved_rps']:,.0f}</td>"
-            f"<td>{c['rtt']['p50_ns'] / 1e3:.1f}</td><td>{c['rtt']['p99_ns'] / 1e3:.1f}</td>"
-            f"<td>{c['rtt']['p999_ns'] / 1e3:.1f}</td><td>{c['rtt']['max_ns'] / 1e3:.1f}</td>"
-            f"<td>{sv['service']['p99_ns'] / 1e3:.2f}</td><td>{c['lost_pct']:.3f}</td>"
+            f"<td class='l'>{esc(r['scenario'])}</td>{''.join(cells)}"
             f"<td>{sy.get('nic_irqs_total', 0):,}</td><td>{sy.get('nic_irqs_on_target_pct') or 0:.1f}</td>"
             f"<td class='l'>{esc(', '.join(f'{k}:{v}' for k, v in sy.get('nic_irqs_by_cpu', {}).items()))}</td></tr>")
     parts.append("</tbody></table></div></details>")
@@ -982,6 +1278,114 @@ def build_html(data, outdir, made, embed=True):
     with open(path, "w") as f:
         f.write("".join(parts))
     return path
+
+
+def summary_keys(workload):
+    if workload == "app":
+        return ["rps", "p50", "p99", "p999", "p9999", "max", "drops", "gaps", "app_ints", "app_nic_ints",
+                "app_other_ints", "app_netrx", "app_irqsoft", "nivcsw", "wait_us", "work_p99", "on_target", "shaped"]
+    return ["rps", "p50", "p99", "p999", "p9999", "svc_p50", "svc_p99", "work_p99", "lost",
+            "app_busy", "app_irqsoft", "irq_cores_busy", "on_target", "nivcsw", "shaped"]
+
+
+def compare_keys(data):
+    keys = ["p50", "p99", "p999", "drops", "app_ints", "nivcsw"] if data.workload == "app" else \
+        ["rps", "p50", "p99", "p999", "svc_p99"]
+    return [k for k in keys if data.has(k)]
+
+
+def write_summary(outdir):
+    """summary.csv and summary.md (the text twin of report.html); returns the markdown."""
+    runs, meta = load(outdir)
+    data = Data(runs, meta)
+    keys = [k for k in summary_keys(data.workload) if data.has(k)]
+    rows = []
+    for mode in data.modes:
+        for r in data.rates(mode):
+            for s in data.scenarios:
+                if (mode, r, s) not in data.groups:
+                    continue
+                row = {"mode": mode, "load": fmt_rate(r), "rate": r, "scenario": s,
+                       "reps": len(data.groups[(mode, r, s)])}
+                for k in keys:
+                    st = data.stat(mode, r, s, k)
+                    row[k], row[k + "_min"], row[k + "_max"] = (st[0], st[1], st[2]) if st else (None, None, None)
+                rows.append(row)
+    with open(os.path.join(outdir, "summary.csv"), "w") as f:
+        cols = list(rows[0].keys()) if rows else []
+        f.write(",".join(cols) + "\n")
+        for row in rows:
+            f.write(",".join("" if row[c] is None else str(round(row[c], 4)) if isinstance(row[c], float)
+                             else str(row[c]) for c in cols) + "\n")
+
+    a = meta.get("args", {})
+    sysi = meta.get("system", {})
+    lines = [f"# irqbench results: {os.path.basename(os.path.abspath(outdir))}", ""]
+    if meta:
+        nics = ", ".join(f"{d} ({n.get('driver')}, {n.get('rx_queues')} rx queues)"
+                         for d, n in sysi.get("nics", {}).items())
+        lines += [f"- host `{sysi.get('hostname')}`, kernel `{sysi.get('kernel')}`, {sysi.get('cpu_model')}",
+                  f"- iface `{a.get('iface')}`, NICs {nics}",
+                  f"- app CPUs `{cpus_str(meta.get('app_cpus', []))}`, IRQ CPUs `{cpus_str(meta.get('irq_cpus', []))}`, "
+                  f"rps={a.get('rps')}, channels={a.get('channels') or 'as found'}, peer {a.get('peer')}",
+                  f"- AWS {sysi.get('aws') or 'n/a'}"]
+        if data.workload == "app":
+            iso = meta.get("isolation", {})
+            lines += [f"- workload: **application** ({'restarted per scenario' if meta.get('app_lifecycle') == 'restart' else 'kept running'})"
+                      f", feed: {(meta.get('feed') or {}).get('describe')}",
+                      f"- latency source: **{(meta.get('latency_source') or {}).get('kind')}**: "
+                      f"{(meta.get('latency_source') or {}).get('meaning')}",
+                      f"- isolated CPUs: `{iso.get('isolated') or 'none'}`, nohz_full: `{iso.get('nohz_full') or 'none'}`"]
+        else:
+            lines += [f"- workload: synthetic RPC, proto {a.get('proto')}, server {a.get('server_mode')}, work "
+                      f"{a.get('work_lines')} lines / {a.get('wss_kb')} KiB, cpu-steer={a.get('cpu_steer')}"]
+        lines += [f"- {a.get('reps')} reps x {a.get('duration')}s; values are medians across reps", ""]
+    warns = warnings_for(data)
+    if warns:
+        lines += ["## Data quality warnings", ""] + [f"- {'⛔' if lvl == 'serious' else '⚠'} {msg}"
+                                                     for lvl, msg in warns[:40]] + [""]
+    if data.workload == "app" and data.has("drops"):
+        lines += ["⛔ Some runs dropped packets or missed sequence numbers." if any_nonzero(data, ("drops", "gaps"))
+                  else "✓ No packet drops or sequence gaps in any run.", ""]
+    lines.append(scenario_markdown(runs, meta))
+    lines += ["## Results", ""]
+    hdr = ["mode", "load", "scenario", "reps"] + [data.label(k) for k in keys]
+    lines.append("| " + " | ".join(hdr) + " |")
+    lines.append("|" + "---|" * len(hdr))
+    for row in rows:
+        vals = [row["mode"], row["load"], row["scenario"], str(row["reps"])]
+        vals += [fmt_num(row[k], METRICS[k][2]) for k in keys]
+        lines.append("| " + " | ".join(vals) + " |")
+    ck = compare_keys(data)
+    pm = data.primary
+    lines += ["", "## Each scenario vs same", "",
+              "Δ is relative to `same`. **clear** = the repetitions' min..max ranges do not overlap "
+              f"(needs ≥2 reps). Winner is judged on {data.label(pm)}.", "",
+              "| mode | load | compare | " + " | ".join(f"{data.label(k)} Δ" for k in ck) + " | winner |",
+              "|" + "---|" * (len(ck) + 4)]
+    for mode in data.modes:
+        for r in data.rates(mode):
+            for s in data.scenarios:
+                if s in ("same", "default") or (mode, r, "same") not in data.groups or (mode, r, s) not in data.groups:
+                    continue
+                cells = []
+                for k in ck:
+                    c = data.compare(mode, r, s, k)
+                    cells.append("–" if not c else f"{c[0]:+.1f}%" + (" **clear**" if c[1] else ""))
+                a_, b_ = data.stat(mode, r, s, pm), data.stat(mode, r, "same", pm)
+                if not a_ or not b_ or min(a_[3], b_[3]) < 2:
+                    win = "need ≥2 reps"
+                elif a_[2] < b_[1]:
+                    win = s
+                elif a_[1] > b_[2]:
+                    win = "same"
+                else:
+                    win = "no clear difference"
+                lines.append(f"| {mode} | {fmt_rate(r)} | {s} vs same | " + " | ".join(cells) + f" | {win} |")
+    md = "\n".join(lines) + "\n"
+    with open(os.path.join(outdir, "summary.md"), "w") as f:
+        f.write(md)
+    return md
 
 
 def build(outdir, embed=True):

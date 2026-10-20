@@ -1,7 +1,9 @@
 # InterBenchmarks
 
 Measures whether it is better to run **NIC interrupts on the same cores as the
-application** or to give **interrupts their own cores**, using real network
+application** or to give **interrupts their own cores**, either with a synthetic
+request/response workload or with **your own application** (for example a
+market-data feed handler on isolated cores, see below), using real network
 traffic, latency percentiles, server-side service time, and per-CPU
 accounting that shows where the interrupts actually landed.
 
@@ -9,7 +11,8 @@ accounting that shows where the interrupts actually landed.
 
 | file | role |
 |---|---|
-| `src/rpcbench.c` | Request/response server and open/closed-loop load generator (UDP or TCP). It prints JSON. |
+| `src/rpcbench.c` | Request/response server and open/closed-loop load generator (UDP or TCP). For market-data testing it adds `pub` (feed publisher), `sub` (synthetic feed handler) and `tap` (passive one-way latency probe). It prints JSON. |
+| `irqapp.py` | The `--workload app` side: attaches to or starts your application, drives the feed, collects latency and interference evidence. |
 | `irqreport.py` | Builds the HTML report and PNG charts from a results directory. `irqbench.py` runs it automatically, and you can also run it on its own on any machine. |
 | `irqbench.py` | Orchestrator for the machine under test (DUT). It applies each placement, runs the load, collects `/proc/interrupts`, `/proc/softirqs` and `/proc/stat` deltas, restores the original state, and writes a report. |
 
@@ -122,6 +125,110 @@ and render it there:
   It delivers each request to the thread pinned on the CPU that did the
   kernel's receive processing, so in `same` the IRQ, softirq and app thread
   share one core and one cache. Turn it off to see plain hash-based placement.
+
+## Testing a real application (market data on isolated cores)
+
+`--workload app` swaps the synthetic RPC server for **your application**.
+Typically that's a feed handler pinned to isolated cores (isolcpus /
+nohz_full), receiving a one-way UDP or TCP feed over kernel sockets. Each
+scenario changes only where the NIC interrupts (and RPS) go. The application
+keeps its own pinning.
+
+```text
+ peer (load side)                        machine under test
+ ┌───────────────────┐   feed (UDP/TCP)   ┌──────────────────────────────────────┐
+ │ builtin publisher │ ─────────────────▶ │ NIC queues ─IRQ─▶ placed per scenario │
+ │ tcpreplay (pcap)  │                    │ app threads ── pinned by the app      │
+ │ your publisher    │                    │ irqbench: counters, latency, restore  │
+ └───────────────────┘                    └──────────────────────────────────────┘
+```
+
+### 1. How the application is run
+
+| option | lifecycle | notes |
+|---|---|---|
+| `--app-pid PID` or `--app-match REGEX` | **kept running**; only the interrupts move | No restart or recovery cost. `--app-cpus auto` reads the CPUs from the app's pinned threads. `same-wide` is skipped because the app can't grow. |
+| `--app-cmd 'CMD'` | **restarted per scenario** | Placeholders: `{cpus} {ncpus} {cpu0} {port} {stats} {bin} {outdir}`. Readiness check: `--app-ready tcp:PORT \| udp:PORT \| file:PATH \| log:REGEX \| cmd:CMD \| delay:S`. Optional `--app-stop-cmd`. stdout goes to `app.log`. |
+
+### 2. What feeds it (`--feed`)
+
+| feed | what runs on the peer | load values (`--rates`) |
+|---|---|---|
+| `pcap:FILE` | `tcpreplay` (≥ 4.3) replaying your capture. `--pcap-rewrite auto` rewrites src/dst IP and MACs for this pair of hosts; `--pcap-keep-dst` keeps multicast destinations; `--pcap-portmap` remaps ports | `1x,2x,5x` speed multipliers, a packets/s figure, or `top` |
+| `cmd:'…'` | your publisher or simulator, with `{host} {port} {rate} {duration} {iface}` placeholders | whatever `{rate}` means to your tool |
+| `builtin` | `rpcbench pub`: paced messages in bursts over N flows, unicast or multicast (`--feed-dest 239.x.x.x`). `--feed-payload FILE` sends a real message template | messages/s |
+| `live` | nothing; it measures whatever the app is receiving | — (not repeatable, so use more reps) |
+
+### 3. Where latency comes from (`--latency`)
+
+| source | measures | needs |
+|---|---|---|
+| `http://…/metrics` + `--latency-metric NAME` | your app's Prometheus **histogram**. The tool scrapes it at the start and end of each window and computes percentiles from the bucket deltas. `--latency-labels k=v` selects series | a histogram metric; `le` in seconds (or set `--latency-unit`) |
+| `cmd:'…'`, `file:PATH`, `http://…` (JSON) | your app's own numbers, such as feed-to-handler or tick-to-trade. Keys like `p50`, `p99`, `p99.9`, `max` (with `_ns`/`_us` suffixes) are found automatically; `--latency-keys p99=stats.lat.p99,...` maps them explicitly | `--latency-unit` if the values aren't in ns. `--latency-reset-cmd` / `--latency-dump-cmd` cut out the window |
+| `ptp` | **one-way wire → kernel receive**, from a passive AF_PACKET tap with kernel timestamps on a housekeeping core. It covers exactly the part IRQ placement changes, without touching the app | send timestamps in the messages (`--feed-ts-offset`, which `builtin` provides) and both hosts clock-synced: chrony with the ENA PTP hardware clock on AWS |
+| `builtin` | one-way latency inside `rpcbench sub`, the synthetic feed handler | used to rehearse the setup before pointing it at the real app |
+| `none` | no latency; findings are based on interference on the app cores | — |
+
+### 4. Collected every run, whatever the latency source
+
+- **Interrupts on the app cores:** every `/proc/interrupts` row (NIC, timer, IPIs, …) and every softirq type, as events per second per core.
+- **Drops:** UDP `RcvbufErrors` / `InErrors`, NIC drops and misses, and **sequence gaps** where the feed has sequence numbers.
+- **App threads:** CPU %, involuntary context switches, run-queue wait (schedstat) and migrations for each busy thread.
+- **NIC:** per-queue RX counts, AWS `*_allowance_exceeded`, and which CPUs the NIC interrupts actually hit.
+- **Host:** isolation settings (`isolated`, `nohz_full`, kernel parameters, busy-poll sysctls), every IRQ allowed on the app CPUs before the run, and clock state (chrony / PHC) on both hosts.
+
+### Getting `same` right with multi-queue NICs
+
+A feed usually lands on only a few RSS queues. Before the matrix, the tool
+spends `--calibrate` seconds (default 3) finding the busiest queues and places
+their IRQs first. If you know which thread reads which queue, set it exactly
+with `--irq-map queue:cpu,…`; in `same`, each queue's interrupt then fires on
+the core of the thread that consumes it.
+
+### Examples
+
+```bash
+# Real feed handler kept running, a recorded feed replayed at 1x/2x/4x, latency from its Prometheus histogram
+sudo ./irqbench.py run --workload app --iface ens6 --app-match 'feedhandler' --app-cpus auto \
+     --irq-cpus 2-3 --peer ssh:ec2-user@10.0.1.20 --deploy \
+     --feed pcap:/data/opra-sample.pcap --rates 1x,2x,4x --pcap-portmap 0-65535:31001 \
+     --latency http://127.0.0.1:9464/metrics --latency-metric md_feed_to_handler_seconds \
+     --reps 5 --duration 20 --stop-irqbalance
+
+# Restarted per scenario (so same-wide is possible), your publisher, JSON latency from a CLI
+sudo ./irqbench.py run --workload app --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
+     --app-cmd '/opt/md/bin/handler --cores {cpus} --config /opt/md/handler.toml' --app-ready log:'subscribed' \
+     --peer ssh:ec2-user@10.0.1.20 --feed cmd:'/opt/md/bin/sim --dst {host}:{port} --mps {rate} --secs {duration}' \
+     --rates 200000,1000000 --latency cmd:'/opt/md/bin/handler-ctl stats --json' \
+     --latency-reset-cmd '/opt/md/bin/handler-ctl stats --reset' --latency-unit us --stop-irqbalance
+
+# One-way wire->kernel latency with PTP-synced clocks; real message template, timestamp at byte 24
+sudo ./irqbench.py run --workload app --iface ens6 --app-pid 41233 --app-cpus auto --irq-cpus 2-3 \
+     --peer ssh:ec2-user@10.0.1.20 --deploy --feed builtin --feed-payload /home/ec2-user/template.bin \
+     --feed-ts-offset 24 --feed-port 31001 --rates 100000,500000,2000000 --latency ptp --stop-irqbalance
+
+# Rehearsal with the synthetic feed handler on the isolated cores
+sudo ./irqbench.py run --workload app --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
+     --app-cmd '{bin} sub --port {port} --threads {ncpus} --cpus {cpus} --spin --stats-file {stats}' \
+     --app-ready udp:9100 --peer ssh:ec2-user@10.0.1.20 --deploy --feed builtin --latency builtin \
+     --rates 100000,1000000 --feed-burst 50
+```
+
+### Isolated-core notes
+
+- Pick `--irq-cpus` from the **housekeeping** cores, not the isolated set, and
+  on the NIC's NUMA node. `separate` is then "isolated cores see only the feed
+  handler".
+- `same` deliberately puts NIC interrupts on the isolated cores. That's the
+  point of the comparison, and it's flagged in the report.
+- Keep the hyperthread siblings of the app cores idle, or test them explicitly
+  with `smt-sibling`.
+- Kernel-bypass stacks (DPDK, AF_XDP, Onload) take NIC interrupts out of the
+  data path. Use this workload only for kernel-socket feeds.
+- AWS: multicast needs a Transit Gateway multicast domain, and pcap replay
+  needs the rewritten source IP/MAC to belong to the peer's ENI
+  (`--pcap-rewrite auto` does this for hosts in the same subnet). ENA
+  per-instance PPS limits apply, so watch the `AWS shaped` column.
 
 ## Running on AWS metal instances
 

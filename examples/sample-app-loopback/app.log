@@ -1,0 +1,100 @@
+
+### 22:22:34 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1000000,"bytes":64000000,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1000000,"mean_ns":2348.5,"p50_ns":2144,"p90_ns":2656,"p99_ns":3552,"p999_ns":9600,"p9999_ns":712704,"max_ns":1057560},"work":{"count":1000000,"mean_ns":651.1,"p50_ns":648,"p90_ns":696,"p99_ns":1016,"p999_ns":2400,"p9999_ns":7104,"max_ns":1055117},"per_thread":[{"cpu":2,"messages":500000,"gaps":0},{"cpu":3,"messages":500000,"gaps":0}]}
+
+### 22:22:37 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":408200,"bytes":26124800,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408200,"mean_ns":2557.7,"p50_ns":2336,"p90_ns":3232,"p99_ns":4160,"p999_ns":21760,"p9999_ns":323584,"max_ns":397321},"work":{"count":408200,"mean_ns":754.1,"p50_ns":680,"p90_ns":936,"p99_ns":1040,"p999_ns":3168,"p9999_ns":7616,"max_ns":26445},"per_thread":[{"cpu":2,"messages":0,"gaps":0},{"cpu":3,"messages":204100,"gaps":0},{"cpu":4,"messages":102050,"gaps":0},{"cpu":5,"messages":102050,"gaps":0}]}
+
+### 22:22:42 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":408340,"bytes":26133760,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408340,"mean_ns":1986.6,"p50_ns":1872,"p90_ns":2208,"p99_ns":3232,"p999_ns":11392,"p9999_ns":56832,"max_ns":719389},"work":{"count":408340,"mean_ns":666.3,"p50_ns":648,"p90_ns":712,"p99_ns":920,"p999_ns":3680,"p9999_ns":7488,"max_ns":26966},"per_thread":[{"cpu":2,"messages":204170,"gaps":0},{"cpu":3,"messages":204170,"gaps":0}]}
+
+### 22:22:48 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407480,"bytes":26078720,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407480,"mean_ns":2291.2,"p50_ns":2208,"p90_ns":2784,"p99_ns":3872,"p999_ns":13952,"p9999_ns":29440,"max_ns":369948},"work":{"count":407480,"mean_ns":678.9,"p50_ns":664,"p90_ns":728,"p99_ns":1016,"p999_ns":3552,"p9999_ns":7488,"max_ns":22070},"per_thread":[{"cpu":2,"messages":203740,"gaps":0},{"cpu":3,"messages":203740,"gaps":0}]}
+
+### 22:22:53 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407502,"bytes":26080128,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407502,"mean_ns":2320.6,"p50_ns":2208,"p90_ns":2848,"p99_ns":3616,"p999_ns":11392,"p9999_ns":182272,"max_ns":530079},"work":{"count":407502,"mean_ns":688.6,"p50_ns":664,"p90_ns":824,"p99_ns":952,"p999_ns":2784,"p9999_ns":7488,"max_ns":42657},"per_thread":[{"cpu":2,"messages":203751,"gaps":0},{"cpu":3,"messages":203751,"gaps":0}]}
+
+### 22:22:58 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":1633402,"bytes":104537728,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1633402,"mean_ns":2648.4,"p50_ns":2528,"p90_ns":3488,"p99_ns":4160,"p999_ns":8576,"p9999_ns":174080,"max_ns":451258},"work":{"count":1633402,"mean_ns":767.5,"p50_ns":712,"p90_ns":936,"p99_ns":1040,"p999_ns":1968,"p9999_ns":8000,"max_ns":396636},"per_thread":[{"cpu":2,"messages":0,"gaps":0},{"cpu":3,"messages":816701,"gaps":0},{"cpu":4,"messages":0,"gaps":0},{"cpu":5,"messages":816701,"gaps":0}]}
+
+### 22:23:04 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1633551,"bytes":104547264,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1633551,"mean_ns":5762.7,"p50_ns":3104,"p90_ns":4800,"p99_ns":7872,"p999_ns":479232,"p9999_ns":487424,"max_ns":493195},"work":{"count":1633551,"mean_ns":684.6,"p50_ns":664,"p90_ns":712,"p99_ns":1040,"p999_ns":3232,"p9999_ns":7104,"max_ns":28491},"per_thread":[{"cpu":2,"messages":1225164,"gaps":0},{"cpu":3,"messages":408387,"gaps":0}]}
+
+### 22:23:09 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1629410,"bytes":104282240,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1629410,"mean_ns":2470.8,"p50_ns":2208,"p90_ns":2784,"p99_ns":3616,"p999_ns":9344,"p9999_ns":942080,"max_ns":1481490},"work":{"count":1629410,"mean_ns":672.8,"p50_ns":664,"p90_ns":728,"p99_ns":904,"p999_ns":2400,"p9999_ns":7232,"max_ns":68869},"per_thread":[{"cpu":2,"messages":814704,"gaps":0},{"cpu":3,"messages":814706,"gaps":0}]}
+
+### 22:23:14 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1630272,"bytes":104337408,"gaps":2900,"reorders":0,"negative_latency":0,"latency":{"count":1630272,"mean_ns":13413.8,"p50_ns":6336,"p90_ns":10368,"p99_ns":16640,"p999_ns":1490944,"p9999_ns":2129920,"max_ns":2618553},"work":{"count":1630272,"mean_ns":659.5,"p50_ns":616,"p90_ns":824,"p99_ns":920,"p999_ns":2656,"p9999_ns":7104,"max_ns":22760},"per_thread":[{"cpu":2,"messages":0,"gaps":0},{"cpu":3,"messages":1630272,"gaps":2900}]}
+
+### 22:23:20 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407320,"bytes":26068480,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407320,"mean_ns":3763.6,"p50_ns":3488,"p90_ns":5824,"p99_ns":7744,"p999_ns":19200,"p9999_ns":194560,"max_ns":244570},"work":{"count":407320,"mean_ns":714.0,"p50_ns":696,"p90_ns":808,"p99_ns":968,"p999_ns":3552,"p9999_ns":7488,"max_ns":22291},"per_thread":[{"cpu":2,"messages":305490,"gaps":0},{"cpu":3,"messages":101830,"gaps":0}]}
+
+### 22:23:25 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407140,"bytes":26056960,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407140,"mean_ns":3181.2,"p50_ns":2912,"p90_ns":4544,"p99_ns":6720,"p999_ns":16256,"p9999_ns":141312,"max_ns":605167},"work":{"count":407140,"mean_ns":702.7,"p50_ns":664,"p90_ns":840,"p99_ns":936,"p999_ns":3552,"p9999_ns":7488,"max_ns":32018},"per_thread":[{"cpu":2,"messages":101785,"gaps":0},{"cpu":3,"messages":305355,"gaps":0}]}
+
+### 22:23:30 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407520,"bytes":26081280,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407520,"mean_ns":2335.8,"p50_ns":2272,"p90_ns":2848,"p99_ns":3872,"p999_ns":14208,"p9999_ns":28416,"max_ns":45178},"work":{"count":407520,"mean_ns":699.6,"p50_ns":680,"p90_ns":776,"p99_ns":968,"p999_ns":3488,"p9999_ns":7488,"max_ns":23507},"per_thread":[{"cpu":2,"messages":203760,"gaps":0},{"cpu":3,"messages":203760,"gaps":0}]}
+
+### 22:23:35 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":408200,"bytes":26124800,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408200,"mean_ns":3820.7,"p50_ns":3296,"p90_ns":5696,"p99_ns":9600,"p999_ns":22784,"p9999_ns":210944,"max_ns":266083},"work":{"count":408200,"mean_ns":802.6,"p50_ns":808,"p90_ns":920,"p99_ns":1072,"p999_ns":3296,"p9999_ns":12416,"max_ns":40211},"per_thread":[{"cpu":2,"messages":306150,"gaps":0},{"cpu":3,"messages":0,"gaps":0},{"cpu":4,"messages":0,"gaps":0},{"cpu":5,"messages":102050,"gaps":0}]}
+
+### 22:23:41 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1633480,"bytes":104542720,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1633480,"mean_ns":2715.1,"p50_ns":2592,"p90_ns":3680,"p99_ns":4928,"p999_ns":7488,"p9999_ns":72704,"max_ns":194527},"work":{"count":1633480,"mean_ns":663.4,"p50_ns":648,"p90_ns":728,"p99_ns":888,"p999_ns":2336,"p9999_ns":7104,"max_ns":28355},"per_thread":[{"cpu":2,"messages":408370,"gaps":0},{"cpu":3,"messages":1225110,"gaps":0}]}
+
+### 22:23:46 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":1633420,"bytes":104538880,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1633420,"mean_ns":2719.1,"p50_ns":2464,"p90_ns":3232,"p99_ns":4288,"p999_ns":9600,"p9999_ns":892928,"max_ns":1425530},"work":{"count":1633420,"mean_ns":788.3,"p50_ns":808,"p90_ns":904,"p99_ns":1104,"p999_ns":3360,"p9999_ns":7360,"max_ns":63062},"per_thread":[{"cpu":2,"messages":816710,"gaps":0},{"cpu":3,"messages":408355,"gaps":0},{"cpu":4,"messages":408355,"gaps":0},{"cpu":5,"messages":0,"gaps":0}]}
+
+### 22:23:51 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1629682,"bytes":104299648,"gaps":3688,"reorders":0,"negative_latency":0,"latency":{"count":1629682,"mean_ns":14742.2,"p50_ns":7744,"p90_ns":12160,"p99_ns":133120,"p999_ns":1392640,"p9999_ns":2129920,"max_ns":2385036},"work":{"count":1629682,"mean_ns":710.0,"p50_ns":680,"p90_ns":744,"p99_ns":904,"p999_ns":3296,"p9999_ns":7232,"max_ns":793870},"per_thread":[{"cpu":2,"messages":1629682,"gaps":3688},{"cpu":3,"messages":0,"gaps":0}]}
+
+### 22:23:57 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1629060,"bytes":104259840,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1629060,"mean_ns":3332.2,"p50_ns":2656,"p90_ns":3808,"p99_ns":5568,"p999_ns":115712,"p9999_ns":141312,"max_ns":463456},"work":{"count":1629060,"mean_ns":677.2,"p50_ns":648,"p90_ns":808,"p99_ns":920,"p999_ns":2272,"p9999_ns":7104,"max_ns":33489},"per_thread":[{"cpu":2,"messages":407265,"gaps":0},{"cpu":3,"messages":1221795,"gaps":0}]}
+
+### 22:24:02 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":408300,"bytes":26131200,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408300,"mean_ns":2516.3,"p50_ns":2400,"p90_ns":3168,"p99_ns":4064,"p999_ns":15744,"p9999_ns":28416,"max_ns":190640},"work":{"count":408300,"mean_ns":782.6,"p50_ns":776,"p90_ns":904,"p99_ns":1040,"p999_ns":3296,"p9999_ns":17152,"max_ns":59137},"per_thread":[{"cpu":2,"messages":102075,"gaps":0},{"cpu":3,"messages":204150,"gaps":0},{"cpu":4,"messages":0,"gaps":0},{"cpu":5,"messages":102075,"gaps":0}]}
+
+### 22:24:07 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":408360,"bytes":26135040,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408360,"mean_ns":3176.7,"p50_ns":2976,"p90_ns":4288,"p99_ns":5824,"p999_ns":22272,"p9999_ns":190464,"max_ns":232044},"work":{"count":408360,"mean_ns":693.7,"p50_ns":664,"p90_ns":776,"p99_ns":936,"p999_ns":4000,"p9999_ns":7488,"max_ns":21801},"per_thread":[{"cpu":2,"messages":102090,"gaps":0},{"cpu":3,"messages":306270,"gaps":0}]}
+
+### 22:24:13 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":408360,"bytes":26135040,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":408360,"mean_ns":2083.8,"p50_ns":2000,"p90_ns":2400,"p99_ns":3744,"p999_ns":12928,"p9999_ns":41472,"max_ns":331752},"work":{"count":408360,"mean_ns":715.3,"p50_ns":696,"p90_ns":824,"p99_ns":1000,"p999_ns":3616,"p9999_ns":7488,"max_ns":330575},"per_thread":[{"cpu":2,"messages":204180,"gaps":0},{"cpu":3,"messages":204180,"gaps":0}]}
+
+### 22:24:18 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":407280,"bytes":26065920,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":407280,"mean_ns":2237.0,"p50_ns":2144,"p90_ns":2784,"p99_ns":3744,"p999_ns":12416,"p9999_ns":25856,"max_ns":155759},"work":{"count":407280,"mean_ns":763.6,"p50_ns":728,"p90_ns":872,"p99_ns":1104,"p999_ns":3680,"p9999_ns":8000,"max_ns":53624},"per_thread":[{"cpu":2,"messages":203640,"gaps":0},{"cpu":3,"messages":203640,"gaps":0}]}
+
+### 22:24:23 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 4 --cpus 2-5 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":4,"busy_poll_us":0,"messages":1632992,"bytes":104511488,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1632992,"mean_ns":2930.9,"p50_ns":2784,"p90_ns":3808,"p99_ns":5952,"p999_ns":8832,"p9999_ns":97280,"max_ns":1087401},"work":{"count":1632992,"mean_ns":856.0,"p50_ns":856,"p90_ns":1016,"p99_ns":1616,"p999_ns":1744,"p9999_ns":7360,"max_ns":1083299},"per_thread":[{"cpu":2,"messages":0,"gaps":0},{"cpu":3,"messages":816496,"gaps":0},{"cpu":4,"messages":816496,"gaps":0},{"cpu":5,"messages":0,"gaps":0}]}
+
+### 22:24:29 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1632838,"bytes":104501632,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1632838,"mean_ns":4696.7,"p50_ns":2592,"p90_ns":3808,"p99_ns":6592,"p999_ns":372736,"p9999_ns":380928,"max_ns":420763},"work":{"count":1632838,"mean_ns":680.8,"p50_ns":648,"p90_ns":760,"p99_ns":936,"p999_ns":3232,"p9999_ns":7104,"max_ns":99272},"per_thread":[{"cpu":2,"messages":408209,"gaps":0},{"cpu":3,"messages":1224629,"gaps":0}]}
+
+### 22:24:34 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1629440,"bytes":104284160,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1629440,"mean_ns":5128.7,"p50_ns":3296,"p90_ns":5056,"p99_ns":6720,"p999_ns":503808,"p9999_ns":1196032,"max_ns":1691330},"work":{"count":1629440,"mean_ns":708.1,"p50_ns":696,"p90_ns":760,"p99_ns":920,"p999_ns":3104,"p9999_ns":7232,"max_ns":23479},"per_thread":[{"cpu":2,"messages":1222080,"gaps":0},{"cpu":3,"messages":407360,"gaps":0}]}
+
+### 22:24:39 start: /opt/InterBenchmarks/rpcbench sub --port 9100 --threads 2 --cpus 2-3 --spin --stats-file examples/sample-app-loopback/app-stats.json
+READY
+{"role":"sub","mode":"spin","threads":2,"busy_poll_us":0,"messages":1629249,"bytes":104271936,"gaps":0,"reorders":0,"negative_latency":0,"latency":{"count":1629249,"mean_ns":6228.0,"p50_ns":3488,"p90_ns":5568,"p99_ns":7872,"p999_ns":479232,"p9999_ns":495616,"max_ns":497459},"work":{"count":1629249,"mean_ns":714.4,"p50_ns":696,"p90_ns":760,"p99_ns":1040,"p999_ns":3488,"p9999_ns":7232,"max_ns":21131},"per_thread":[{"cpu":2,"messages":1221937,"gaps":0},{"cpu":3,"messages":407312,"gaps":0}]}

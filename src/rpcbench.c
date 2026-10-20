@@ -20,7 +20,11 @@
 #include <getopt.h>
 #include <linux/filter.h>
 #include <math.h>
+#include <net/if.h>
 #include <netdb.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -208,7 +212,7 @@ static int write_full(int fd, const char *buf, size_t len)
 /* Options                                                                   */
 
 struct opts {
-	int is_server;
+	int mode; /* 0 server, 1 client, 2 pub, 3 sub, 4 tap */
 	int tcp;
 	int port;
 	char host[256];
@@ -231,6 +235,10 @@ struct opts {
 	double duration;
 	double warmup;
 	int timeout_ms;
+	/* feed modes */
+	int burst, flows, ttl, busy_poll;
+	int seq_offset, ts_offset, flow_offset;
+	char payload[256], mcast_if[64], groups[1024], iface[64], stats_file[512];
 };
 
 static struct opts O = {
@@ -246,6 +254,12 @@ static struct opts O = {
 	.duration = 10,
 	.warmup = 2,
 	.timeout_ms = 200,
+	.burst = 1,
+	.flows = 1,
+	.ttl = 8,
+	.seq_offset = -2,
+	.ts_offset = -2,
+	.flow_offset = -2,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -719,17 +733,486 @@ static int run_client(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Feed modes: one-way, market-data style traffic                            */
+/*                                                                          */
+/*   pub  publishes UDP messages (unicast or multicast) at a paced rate, in   */
+/*        bursts, over several flows.  Default message layout:               */
+/*          [0..7] per-flow sequence  [8..15] CLOCK_REALTIME send ns          */
+/*          [16..19] flow id                                                 */
+/*   sub  a synthetic feed handler: pinned threads, optional busy polling,   */
+/*        sequence-gap detection, one-way latency (needs synced clocks       */
+/*        across hosts, e.g. PTP/chrony) and per-message work.               */
+/*   tap  passive probe: AF_PACKET socket with kernel RX timestamps, giving  */
+/*        one-way wire -> kernel-receive latency without touching the app.    */
+/*                                                                          */
+/* sub and tap reset their statistics on SIGUSR1 and write a JSON snapshot   */
+/* to --stats-file on SIGUSR2, so a measurement window can be cut out of a    */
+/* long-running process.                                                     */
+
+#define MAX_FLOWS 4096
+
+static volatile sig_atomic_t g_reset_req, g_dump_req;
+static atomic_uint g_epoch;
+
+static void on_usr1(int sig) { (void)sig; g_reset_req = 1; }
+static void on_usr2(int sig) { (void)sig; g_dump_req = 1; }
+
+static inline uint64_t real_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+static struct sockaddr_in resolve(const char *host, int port)
+{
+	struct addrinfo hints = {.ai_family = AF_INET}, *res;
+	int rc = getaddrinfo(host, NULL, &hints, &res);
+	if (rc) {
+		fprintf(stderr, "getaddrinfo(%s): %s\n", host, gai_strerror(rc));
+		exit(1);
+	}
+	struct sockaddr_in a = *(struct sockaddr_in *)res->ai_addr;
+	a.sin_port = htons(port);
+	freeaddrinfo(res);
+	return a;
+}
+
+static void write_stats(void (*fn)(FILE *))
+{
+	if (!O.stats_file[0])
+		return;
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", O.stats_file);
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		perror(tmp);
+		return;
+	}
+	fn(f);
+	fclose(f);
+	rename(tmp, O.stats_file);
+}
+
+static void resolve_offsets(void)
+{
+	/* -2 = not given: default layout, or nothing when a payload template is used */
+	int tmpl = O.payload[0] != 0;
+	if (O.seq_offset == -2)
+		O.seq_offset = tmpl ? -1 : 0;
+	if (O.ts_offset == -2)
+		O.ts_offset = tmpl ? -1 : 8;
+	if (O.flow_offset == -2)
+		O.flow_offset = tmpl ? -1 : 16;
+}
+
+/* ---- pub ---- */
+
+static int run_pub(void)
+{
+	pin_self(O.cpus[0]);
+	resolve_offsets();
+	static char msg[MAX_MSG];
+	int size = O.req_size;
+	if (O.payload[0]) {
+		FILE *f = fopen(O.payload, "rb");
+		if (!f)
+			die(O.payload);
+		size = (int)fread(msg, 1, sizeof(msg), f);
+		fclose(f);
+	}
+	struct sockaddr_in dst = resolve(O.host, O.port);
+	int mc = IN_MULTICAST(ntohl(dst.sin_addr.s_addr));
+	int *fds = calloc(O.flows, sizeof(int));
+	uint64_t *seq = calloc(O.flows, sizeof(uint64_t));
+	for (int f = 0; f < O.flows; f++) {
+		int fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (fd < 0)
+			die("socket");
+		int big = 4 << 20;
+		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+		if (mc) {
+			unsigned char ttl = (unsigned char)O.ttl;
+			setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+			if (O.mcast_if[0]) {
+				struct in_addr ifa;
+				inet_pton(AF_INET, O.mcast_if, &ifa);
+				if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa)) < 0)
+					die("IP_MULTICAST_IF");
+			}
+		}
+		if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0)
+			die("connect");
+		fds[f] = fd;
+	}
+
+	double interval = O.rate > 0 ? 1e9 * O.burst / O.rate : 0; /* ns between bursts */
+	uint64_t start = now_ns() + 100000000ull;
+	uint64_t end = start + (uint64_t)(O.duration * 1e9);
+	double next = (double)start;
+	uint64_t sent = 0, errs = 0, max_lag = 0;
+	int rr = 0;
+	while (now_ns() < start)
+		;
+	while (!g_stop) {
+		uint64_t now = now_ns();
+		if (now >= end)
+			break;
+		if (interval > 0) {
+			if ((double)now < next) {
+				double gap = next - (double)now;
+				if (gap > 200000)
+					usleep((useconds_t)(gap / 1000) - 100);
+				continue;
+			}
+			if ((double)now - next > (double)max_lag)
+				max_lag = (uint64_t)((double)now - next);
+		}
+		for (int b = 0; b < O.burst; b++) {
+			int f = rr;
+			rr = (rr + 1) % O.flows;
+			if (O.seq_offset >= 0 && size >= O.seq_offset + 8)
+				memcpy(msg + O.seq_offset, &seq[f], 8);
+			if (O.flow_offset >= 0 && size >= O.flow_offset + 4) {
+				uint32_t fid = (uint32_t)f;
+				memcpy(msg + O.flow_offset, &fid, 4);
+			}
+			if (O.ts_offset >= 0 && size >= O.ts_offset + 8) {
+				uint64_t ts = real_ns();
+				memcpy(msg + O.ts_offset, &ts, 8);
+			}
+			if (send(fds[f], msg, size, 0) == size) {
+				sent++;
+				seq[f]++;
+			} else {
+				errs++;
+			}
+		}
+		next += interval;
+	}
+	double secs = (double)(now_ns() - start) / 1e9;
+	printf("{\"role\":\"pub\",\"host\":\"%s\",\"port\":%d,\"multicast\":%s,\"flows\":%d,\"burst\":%d,"
+	       "\"size\":%d,\"target_mps\":%.0f,\"sent\":%llu,\"send_errors\":%llu,\"duration_s\":%.3f,"
+	       "\"achieved_mps\":%.1f,\"max_sched_lag_ns\":%llu}\n",
+	       O.host, O.port, mc ? "true" : "false", O.flows, O.burst, size, O.rate,
+	       (unsigned long long)sent, (unsigned long long)errs, secs, secs > 0 ? sent / secs : 0,
+	       (unsigned long long)max_lag);
+	return 0;
+}
+
+/* ---- sub ---- */
+
+struct sub_thread {
+	pthread_t tid;
+	int idx, cpu, fd;
+	hist_t lat, work;
+	uint64_t msgs, bytes, gaps, reorders, neg, sink;
+	uint64_t last_seq[MAX_FLOWS];
+};
+
+static struct sub_thread *g_subs;
+
+static void track(struct sub_thread *t, const char *buf, ssize_t r, uint64_t now)
+{
+	t->msgs++;
+	t->bytes += r;
+	if (O.ts_offset >= 0 && r >= O.ts_offset + 8) {
+		uint64_t ts;
+		memcpy(&ts, buf + O.ts_offset, 8);
+		if (now >= ts)
+			hist_add(&t->lat, now - ts);
+		else
+			t->neg++;
+	}
+	if (O.seq_offset >= 0 && r >= O.seq_offset + 8) {
+		uint64_t s;
+		uint32_t flow = 0;
+		memcpy(&s, buf + O.seq_offset, 8);
+		if (O.flow_offset >= 0 && r >= O.flow_offset + 4)
+			memcpy(&flow, buf + O.flow_offset, 4);
+		flow %= MAX_FLOWS;
+		uint64_t last = t->last_seq[flow];
+		if (last != UINT64_MAX) {
+			if (s > last + 1)
+				t->gaps += s - last - 1;
+			else if (s <= last)
+				t->reorders++;
+		}
+		if (last == UINT64_MAX || s > last)
+			t->last_seq[flow] = s;
+	}
+}
+
+static void *sub_thread_fn(void *arg)
+{
+	struct sub_thread *t = arg;
+	pin_self(t->cpu);
+	size_t nlines = (size_t)O.wss_kb * 1024 / 64;
+	if (!nlines)
+		nlines = 1;
+	char *buf = aligned_alloc(64, nlines * 64);
+	memset(buf, 1, nlines * 64);
+	uint64_t rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(t->idx + 1);
+	static __thread char rx[MAX_MSG];
+	unsigned epoch = atomic_load(&g_epoch);
+	struct pollfd pfd = {.fd = t->fd, .events = POLLIN};
+
+	while (!g_stop) {
+		unsigned e = atomic_load(&g_epoch);
+		if (e != epoch) {
+			epoch = e;
+			memset(&t->lat, 0, sizeof(t->lat));
+			memset(&t->work, 0, sizeof(t->work));
+			t->msgs = t->bytes = t->gaps = t->reorders = t->neg = 0;
+		}
+		if (!O.spin && poll(&pfd, 1, 100) <= 0)
+			continue;
+		for (;;) {
+			ssize_t r = recv(t->fd, rx, sizeof(rx), MSG_DONTWAIT);
+			if (r < 0)
+				break;
+			track(t, rx, r, real_ns());
+			if (O.work_lines > 0) {
+				uint64_t t0 = now_ns();
+				t->sink += do_work(buf, nlines, O.work_lines, &rng);
+				hist_add(&t->work, now_ns() - t0);
+			}
+			if (!O.spin)
+				continue;
+			break; /* spinning: re-check the epoch between messages */
+		}
+	}
+	free(buf);
+	return NULL;
+}
+
+static void sub_json(FILE *f)
+{
+	hist_t lat = {0}, work = {0};
+	uint64_t msgs = 0, bytes = 0, gaps = 0, reorders = 0, neg = 0;
+	for (int i = 0; i < O.nthreads; i++) {
+		hist_merge(&lat, &g_subs[i].lat);
+		hist_merge(&work, &g_subs[i].work);
+		msgs += g_subs[i].msgs;
+		bytes += g_subs[i].bytes;
+		gaps += g_subs[i].gaps;
+		reorders += g_subs[i].reorders;
+		neg += g_subs[i].neg;
+	}
+	fprintf(f, "{\"role\":\"sub\",\"mode\":\"%s\",\"threads\":%d,\"busy_poll_us\":%d,\"messages\":%llu,"
+		   "\"bytes\":%llu,\"gaps\":%llu,\"reorders\":%llu,\"negative_latency\":%llu,",
+		O.spin ? "spin" : "block", O.nthreads, O.busy_poll, (unsigned long long)msgs,
+		(unsigned long long)bytes, (unsigned long long)gaps, (unsigned long long)reorders,
+		(unsigned long long)neg);
+	hist_json(f, "latency", &lat);
+	fputc(',', f);
+	hist_json(f, "work", &work);
+	fprintf(f, ",\"per_thread\":[");
+	for (int i = 0; i < O.nthreads; i++)
+		fprintf(f, "%s{\"cpu\":%d,\"messages\":%llu,\"gaps\":%llu}", i ? "," : "", g_subs[i].cpu,
+			(unsigned long long)g_subs[i].msgs, (unsigned long long)g_subs[i].gaps);
+	fprintf(f, "]}\n");
+}
+
+static int sub_socket(int i, char groups[][64], int ngroups)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		die("socket");
+	int one = 1, big = 16 << 20;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	if (O.busy_poll > 0)
+		setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &O.busy_poll, sizeof(O.busy_poll));
+	struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(O.port),
+				.sin_addr.s_addr = htonl(INADDR_ANY)};
+	if (ngroups) {
+		/* one multicast group per thread (round robin); bind to the group to filter */
+		const char *g = groups[i % ngroups];
+		inet_pton(AF_INET, g, &a.sin_addr);
+		struct ip_mreq mr = {.imr_interface.s_addr = htonl(INADDR_ANY)};
+		inet_pton(AF_INET, g, &mr.imr_multiaddr);
+		if (O.mcast_if[0])
+			inet_pton(AF_INET, O.mcast_if, &mr.imr_interface);
+		if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+			die("bind");
+		if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) < 0)
+			die("IP_ADD_MEMBERSHIP");
+	} else if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		die("bind");
+	}
+	set_nonblock(fd);
+	return fd;
+}
+
+static int run_sub(void)
+{
+	resolve_offsets();
+	char groups[64][64];
+	int ngroups = 0;
+	if (O.groups[0]) {
+		char *dup = strdup(O.groups), *save = NULL;
+		for (char *g = strtok_r(dup, ",", &save); g && ngroups < 64; g = strtok_r(NULL, ",", &save))
+			snprintf(groups[ngroups++], 64, "%s", g);
+		free(dup);
+	}
+	g_subs = calloc(O.nthreads, sizeof(*g_subs));
+	for (int i = 0; i < O.nthreads; i++) {
+		g_subs[i].idx = i;
+		g_subs[i].cpu = O.cpus[i % O.ncpus];
+		memset(g_subs[i].last_seq, 0xff, sizeof(g_subs[i].last_seq));
+		g_subs[i].fd = sub_socket(i, groups, ngroups);
+	}
+	if (O.cpu_steer && !ngroups) {
+		struct srv_thread *ts = calloc(O.nthreads, sizeof(*ts));
+		for (int i = 0; i < O.nthreads; i++)
+			ts[i].cpu = g_subs[i].cpu;
+		attach_cpu_steering(g_subs[0].fd, ts);
+		free(ts);
+	}
+	for (int i = 0; i < O.nthreads; i++)
+		if (pthread_create(&g_subs[i].tid, NULL, sub_thread_fn, &g_subs[i]))
+			die("pthread_create");
+	fprintf(stderr, "READY\n");
+	fflush(stderr);
+
+	uint64_t start = now_ns();
+	while (!g_stop) {
+		usleep(2000);
+		if (g_reset_req) {
+			g_reset_req = 0;
+			atomic_fetch_add(&g_epoch, 1);
+		}
+		if (g_dump_req) {
+			g_dump_req = 0;
+			write_stats(sub_json);
+		}
+		if (O.max_seconds > 0 && (now_ns() - start) / 1e9 >= O.max_seconds)
+			g_stop = 1;
+	}
+	for (int i = 0; i < O.nthreads; i++)
+		pthread_join(g_subs[i].tid, NULL);
+	write_stats(sub_json);
+	sub_json(stdout);
+	fflush(stdout);
+	return 0;
+}
+
+/* ---- tap ---- */
+
+static hist_t g_tap_lat;
+static uint64_t g_tap_msgs, g_tap_neg;
+
+static void tap_json(FILE *f)
+{
+	fprintf(f, "{\"role\":\"tap\",\"iface\":\"%s\",\"port\":%d,\"messages\":%llu,\"negative_latency\":%llu,",
+		O.iface, O.port, (unsigned long long)g_tap_msgs, (unsigned long long)g_tap_neg);
+	hist_json(f, "latency", &g_tap_lat);
+	fprintf(f, "}\n");
+}
+
+static int run_tap(void)
+{
+	pin_self(O.cpus[0]);
+	resolve_offsets();
+	if (O.ts_offset < 0) {
+		fprintf(stderr, "tap needs --ts-offset >= 0 (where the sender put its timestamp)\n");
+		return 2;
+	}
+	int fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+	if (fd < 0)
+		die("socket(AF_PACKET)");
+	/* accept only unfragmented UDP to --port */
+	struct sock_filter code[] = {
+		BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 9),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_UDP, 0, 6),
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 6),
+		BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x1fff, 4, 0),
+		BPF_STMT(BPF_LDX | BPF_B | BPF_MSH, 0),
+		BPF_STMT(BPF_LD | BPF_H | BPF_IND, 2),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)O.port, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 0xffff),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog prog = {.len = sizeof(code) / sizeof(code[0]), .filter = code};
+	if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) < 0)
+		die("SO_ATTACH_FILTER");
+	struct sockaddr_ll sll = {.sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_IP),
+				  .sll_ifindex = (int)if_nametoindex(O.iface)};
+	if (!sll.sll_ifindex) {
+		fprintf(stderr, "unknown interface %s\n", O.iface);
+		return 2;
+	}
+	if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0)
+		die("bind(AF_PACKET)");
+	int on = 1, big = 16 << 20;
+	setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on));
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+	fprintf(stderr, "READY\n");
+	fflush(stderr);
+
+	static char buf[MAX_MSG];
+	char ctrl[256];
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	uint64_t start = now_ns();
+	while (!g_stop) {
+		if (g_reset_req) {
+			g_reset_req = 0;
+			memset(&g_tap_lat, 0, sizeof(g_tap_lat));
+			g_tap_msgs = g_tap_neg = 0;
+		}
+		if (g_dump_req) {
+			g_dump_req = 0;
+			write_stats(tap_json);
+		}
+		if (O.max_seconds > 0 && (now_ns() - start) / 1e9 >= O.max_seconds)
+			break;
+		if (poll(&pfd, 1, 50) <= 0)
+			continue;
+		struct sockaddr_ll from;
+		struct iovec iov = {.iov_base = buf, .iov_len = sizeof(buf)};
+		struct msghdr mh = {.msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &iov,
+				    .msg_iovlen = 1, .msg_control = ctrl, .msg_controllen = sizeof(ctrl)};
+		ssize_t r = recvmsg(fd, &mh, MSG_DONTWAIT);
+		if (r < 20 || from.sll_pkttype == PACKET_OUTGOING)
+			continue;
+		uint64_t rx = 0;
+		for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c))
+			if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+				struct timespec ts;
+				memcpy(&ts, CMSG_DATA(c), sizeof(ts));
+				rx = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+			}
+		int off = (buf[0] & 0xf) * 4 + 8 + O.ts_offset;
+		if (!rx || r < off + 8)
+			continue;
+		uint64_t sent;
+		memcpy(&sent, buf + off, 8);
+		g_tap_msgs++;
+		if (rx >= sent)
+			hist_add(&g_tap_lat, rx - sent);
+		else
+			g_tap_neg++;
+	}
+	write_stats(tap_json);
+	tap_json(stdout);
+	fflush(stdout);
+	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
 
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: rpcbench server|client [options]\n"
+		"usage: rpcbench server|client|pub|sub|tap [options]\n"
 		"common:\n"
-		"  --proto udp|tcp      transport (default udp)\n"
+		"  --proto udp|tcp      transport (default udp; feed modes are UDP only)\n"
 		"  --port N             port (default 9000)\n"
 		"  --threads N          worker threads (default 1)\n"
 		"  --cpus LIST          CPUs to pin threads to, round-robin (default 0)\n"
-		"  --req-size B         request size, >=16 (default 64)\n"
+		"  --req-size B         request / feed message size, >=16 (default 64); alias --size\n"
 		"  --resp-size B        response size, >=16 (default 64)\n"
 		"server:\n"
 		"  --spin               busy-poll instead of blocking in epoll_wait\n"
@@ -746,7 +1229,28 @@ static void usage(void)
 		"  --outstanding N      in-flight requests per connection, closed loop (default 1)\n"
 		"  --duration S         measured seconds (default 10)\n"
 		"  --warmup S           unmeasured warm-up seconds (default 2)\n"
-		"  --timeout-ms N       UDP loss timeout / drain time (default 200)\n");
+		"  --timeout-ms N       UDP loss timeout / drain time (default 200)\n"
+		"pub (feed publisher):\n"
+		"  --host H             destination address or multicast group\n"
+		"  --rate R             total messages/s (0 = as fast as possible)\n"
+		"  --burst N            messages sent back-to-back per tick (default 1)\n"
+		"  --flows N            source sockets/ports, spreads RSS (default 1)\n"
+		"  --duration S         seconds to publish (default 10)\n"
+		"  --payload FILE       send this file's bytes as every message\n"
+		"  --mcast-if ADDR      local address for multicast; --ttl N (default 8)\n"
+		"sub (synthetic feed handler) / tap (passive latency probe):\n"
+		"  --group G[,G...]     multicast groups to join, one per thread (sub)\n"
+		"  --mcast-if ADDR      interface address for the joins (sub)\n"
+		"  --spin               busy-poll the socket (sub); --busy-poll US sets SO_BUSY_POLL\n"
+		"  --cpu-steer          reuseport steering by receive CPU (sub, unicast)\n"
+		"  --work-lines/--wss-kb  per-message work (sub, default 256 / 512)\n"
+		"  --iface IF           interface to tap (tap)\n"
+		"  --stats-file F       JSON snapshot on SIGUSR2 and exit; SIGUSR1 resets stats\n"
+		"feed message layout (pub/sub/tap):\n"
+		"  --seq-offset N       per-flow u64 sequence (default 0, -1 = none)\n"
+		"  --ts-offset N        u64 CLOCK_REALTIME send ns (default 8, -1 = none)\n"
+		"  --flow-offset N      u32 flow id (default 16, -1 = none)\n"
+		"  (with --payload the defaults are -1: nothing is overwritten)\n");
 	exit(2);
 }
 
@@ -754,18 +1258,26 @@ int main(int argc, char **argv)
 {
 	if (argc < 2)
 		usage();
-	if (!strcmp(argv[1], "server"))
-		O.is_server = 1;
-	else if (strcmp(argv[1], "client"))
+	const char *modes[] = {"server", "client", "pub", "sub", "tap"};
+	O.mode = -1;
+	for (int i = 0; i < 5; i++)
+		if (!strcmp(argv[1], modes[i]))
+			O.mode = i;
+	if (O.mode < 0)
 		usage();
 
 	static struct option lo[] = {
 		{"proto", 1, 0, 'p'},	    {"port", 1, 0, 'P'},     {"threads", 1, 0, 't'},
-		{"cpus", 1, 0, 'c'},	    {"req-size", 1, 0, 'q'}, {"resp-size", 1, 0, 'r'},
-		{"spin", 0, 0, 's'},	    {"cpu-steer", 0, 0, 'S'},	    {"work-lines", 1, 0, 'w'}, {"wss-kb", 1, 0, 'W'},
-		{"max-seconds", 1, 0, 'M'}, {"host", 1, 0, 'H'},     {"conns", 1, 0, 'n'},
-		{"rate", 1, 0, 'R'},	    {"poisson", 0, 0, 'X'},  {"outstanding", 1, 0, 'o'},
-		{"duration", 1, 0, 'd'},    {"warmup", 1, 0, 'u'},   {"timeout-ms", 1, 0, 'T'},
+		{"cpus", 1, 0, 'c'},	    {"req-size", 1, 0, 'q'}, {"size", 1, 0, 'q'},
+		{"resp-size", 1, 0, 'r'},   {"spin", 0, 0, 's'},     {"cpu-steer", 0, 0, 'S'},
+		{"work-lines", 1, 0, 'w'},  {"wss-kb", 1, 0, 'W'},   {"max-seconds", 1, 0, 'M'},
+		{"host", 1, 0, 'H'},	    {"conns", 1, 0, 'n'},    {"rate", 1, 0, 'R'},
+		{"poisson", 0, 0, 'X'},	    {"outstanding", 1, 0, 'o'}, {"duration", 1, 0, 'd'},
+		{"warmup", 1, 0, 'u'},	    {"timeout-ms", 1, 0, 'T'}, {"burst", 1, 0, 'B'},
+		{"flows", 1, 0, 'F'},	    {"payload", 1, 0, 'L'},  {"mcast-if", 1, 0, 'I'},
+		{"ttl", 1, 0, 'Y'},	    {"group", 1, 0, 'G'},    {"busy-poll", 1, 0, 'b'},
+		{"iface", 1, 0, 'i'},	    {"stats-file", 1, 0, 'f'}, {"seq-offset", 1, 0, 1},
+		{"ts-offset", 1, 0, 2},	    {"flow-offset", 1, 0, 3},
 		{0, 0, 0, 0}};
 	O.cpus[0] = 0;
 	O.ncpus = 1;
@@ -792,19 +1304,44 @@ int main(int argc, char **argv)
 		case 'd': O.duration = atof(optarg); break;
 		case 'u': O.warmup = atof(optarg); break;
 		case 'T': O.timeout_ms = atoi(optarg); break;
+		case 'B': O.burst = atoi(optarg); break;
+		case 'F': O.flows = atoi(optarg); break;
+		case 'L': snprintf(O.payload, sizeof(O.payload), "%s", optarg); break;
+		case 'I': snprintf(O.mcast_if, sizeof(O.mcast_if), "%s", optarg); break;
+		case 'Y': O.ttl = atoi(optarg); break;
+		case 'G': snprintf(O.groups, sizeof(O.groups), "%s", optarg); break;
+		case 'b': O.busy_poll = atoi(optarg); break;
+		case 'i': snprintf(O.iface, sizeof(O.iface), "%s", optarg); break;
+		case 'f': snprintf(O.stats_file, sizeof(O.stats_file), "%s", optarg); break;
+		case 1: O.seq_offset = atoi(optarg); break;
+		case 2: O.ts_offset = atoi(optarg); break;
+		case 3: O.flow_offset = atoi(optarg); break;
 		default: usage();
 		}
 	}
 	if (O.req_size < HDR_SIZE || O.req_size > MAX_MSG || O.resp_size < HDR_SIZE ||
 	    O.resp_size > MAX_MSG || O.nthreads < 1 || O.ncpus < 1 || O.conns < 1 ||
-	    O.outstanding < 1) {
+	    O.outstanding < 1 || O.burst < 1 || O.flows < 1 || O.flows > MAX_FLOWS) {
 		fprintf(stderr, "invalid option values\n");
+		return 2;
+	}
+	if (O.mode == 4 && !O.iface[0]) {
+		fprintf(stderr, "tap needs --iface\n");
 		return 2;
 	}
 
 	struct sigaction sa = {.sa_handler = on_signal};
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	struct sigaction s1 = {.sa_handler = on_usr1}, s2 = {.sa_handler = on_usr2};
+	sigaction(SIGUSR1, &s1, NULL);
+	sigaction(SIGUSR2, &s2, NULL);
 	signal(SIGPIPE, SIG_IGN);
-	return O.is_server ? run_server() : run_client();
+	switch (O.mode) {
+	case 0: return run_server();
+	case 1: return run_client();
+	case 2: return run_pub();
+	case 3: return run_sub();
+	default: return run_tap();
+	}
 }

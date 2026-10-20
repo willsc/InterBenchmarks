@@ -1,0 +1,368 @@
+{
+  "args": {
+    "cmd": "run",
+    "iface": "bond0",
+    "workload": "app",
+    "app_cpus": "2-3",
+    "irq_cpus": "4-5",
+    "peer": "local",
+    "deploy": false,
+    "server_addr": "127.0.0.1",
+    "scenarios": "default,same,separate,same-wide",
+    "rates": "100000,400000",
+    "reps": 3,
+    "duration": 3.0,
+    "warmup": 0.5,
+    "settle": 0.5,
+    "proto": "udp",
+    "server_mode": "block",
+    "server_threads": 0,
+    "work_lines": 256,
+    "wss_kb": 512,
+    "req_size": 64,
+    "resp_size": 64,
+    "client_threads": 2,
+    "client_cpus": "0-1",
+    "conns": 16,
+    "outstanding": 1,
+    "poisson": false,
+    "rps": "auto",
+    "cpu_steer": true,
+    "channels": null,
+    "irq_filter": null,
+    "stop_irqbalance": false,
+    "port": 9000,
+    "app_cmd": "{bin} sub --port {port} --threads {ncpus} --cpus {cpus} --spin --stats-file {stats}",
+    "app_stop_cmd": null,
+    "app_pid": null,
+    "app_match": null,
+    "app_ready": "udp:9100",
+    "app_ready_timeout": 60,
+    "app_stats_file": null,
+    "feed": "builtin",
+    "feed_dest": "127.0.0.1",
+    "feed_port": 9100,
+    "feed_size": 64,
+    "feed_burst": 20,
+    "feed_flows": 4,
+    "feed_payload": null,
+    "feed_ts_offset": null,
+    "feed_mcast_if": null,
+    "feed_cpus": "0",
+    "peer_iface": null,
+    "peer_ip": null,
+    "pcap_rewrite": "auto",
+    "pcap_keep_dst": false,
+    "pcap_portmap": null,
+    "latency": "builtin",
+    "latency_format": null,
+    "latency_metric": null,
+    "latency_labels": null,
+    "latency_keys": null,
+    "latency_unit": null,
+    "latency_reset_cmd": null,
+    "latency_dump_cmd": null,
+    "tap_iface": null,
+    "tap_cpu": null,
+    "calibrate": 1.0,
+    "irq_map": null,
+    "seed": 1,
+    "out": "examples/sample-app-loopback",
+    "bin": "/opt/InterBenchmarks/rpcbench",
+    "dry_run": false,
+    "feed_dest_ip": "127.0.0.1"
+  },
+  "started": "20261020-222234",
+  "system": {
+    "hostname": "sample-host",
+    "kernel": "6.17.0-35-generic",
+    "cmdline": "(redacted)",
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+    "online_cpus": "0-15",
+    "governors": [
+      "powersave"
+    ],
+    "core_types": {
+      "0": "P",
+      "1": "P",
+      "2": "P",
+      "3": "P",
+      "4": "P",
+      "5": "P",
+      "6": "E",
+      "7": "E",
+      "8": "E",
+      "9": "E",
+      "10": "E",
+      "11": "E",
+      "12": "E",
+      "13": "E"
+    },
+    "nics": {
+      "enp44s0": {
+        "driver": "r8169",
+        "irqs": [
+          158
+        ],
+        "numa_node": -1,
+        "rx_queues": 1,
+        "speed": "2500",
+        "ethtool_i": "driver: r8169\nversion: 6.17.0-35-generic\nfirmware-version: rtl8125b-2_0.0.2 07/13/20\nexpansion-rom-version: \nbus-info: 0000:2c:00.0\nsupports-statistics: yes\nsupports-test: no\nsupports-eeprom-access: no\nsupports-register-dump: yes\nsupports-priv-flags: no\n",
+        "ethtool_l": "",
+        "ethtool_c": ""
+      }
+    },
+    "numa_nodes": {
+      "node0": "0-15"
+    },
+    "smt_active": "0",
+    "aws": {}
+  },
+  "initial_state": {
+    "irq_affinity": {
+      "158": "0-15"
+    },
+    "rps_cpus": {
+      "/sys/class/net/enp44s0/queues/rx-0": "0000"
+    },
+    "irqbalance_was_active": false,
+    "channels": {}
+  },
+  "app_cpus": [
+    2,
+    3
+  ],
+  "irq_cpus": [
+    4,
+    5
+  ],
+  "skipped_scenarios": {},
+  "loads": [
+    [
+      100000.0,
+      "100K msg/s"
+    ],
+    [
+      400000.0,
+      "400K msg/s"
+    ]
+  ],
+  "workload": "app",
+  "app_lifecycle": "restart",
+  "app_cmd": "{bin} sub --port {port} --threads {ncpus} --cpus {cpus} --spin --stats-file {stats}",
+  "app_pid": null,
+  "app_comm": null,
+  "feed": {
+    "kind": "builtin",
+    "describe": "builtin publisher on the peer: 64 B messages to 127.0.0.1:9100, 4 flow(s), bursts of 20"
+  },
+  "latency_source": {
+    "kind": "builtin",
+    "meaning": "One-way latency from the publisher's send timestamp (CLOCK_REALTIME) to the moment the feed-handler thread read the message: wire, NIC, interrupt, softirq, socket and wake-up. Across two hosts this is only as accurate as their clock sync (see Clocks)."
+  },
+  "isolation": {
+    "isolated": "",
+    "nohz_full": "",
+    "cmdline_params": {},
+    "default_smp_affinity": "ffff",
+    "sysctls": {
+      "net.core.busy_poll": "0",
+      "net.core.busy_read": "0",
+      "net.core.netdev_budget": "300",
+      "net.core.netdev_budget_usecs": "2000",
+      "net.core.rps_sock_flow_entries": "0",
+      "kernel.timer_migration": "1",
+      "kernel.sched_rt_runtime_us": "950000",
+      "vm.stat_interval": "1"
+    }
+  },
+  "irqs_allowed_on_app_cpus": [
+    {
+      "irq": 1,
+      "name": "IR-IO-APIC 1-edge i8042",
+      "affinity": "0-15",
+      "effective": "8"
+    },
+    {
+      "irq": 8,
+      "name": "IR-IO-APIC 8-edge rtc0",
+      "affinity": "0-15",
+      "effective": "9"
+    },
+    {
+      "irq": 9,
+      "name": "IR-IO-APIC 9-fasteoi acpi",
+      "affinity": "0-15",
+      "effective": "0"
+    },
+    {
+      "irq": 12,
+      "name": "IR-IO-APIC 12-edge i8042",
+      "affinity": "0-15",
+      "effective": "7"
+    },
+    {
+      "irq": 14,
+      "name": "IR-IO-APIC 14-fasteoi INTC105E:00",
+      "affinity": "0-15",
+      "effective": "10"
+    },
+    {
+      "irq": 18,
+      "name": "IR-IO-APIC 18-fasteoi i801_smbus",
+      "affinity": "0-15",
+      "effective": "0"
+    },
+    {
+      "irq": 120,
+      "name": "DMAR-MSI 0-edge dmar0",
+      "affinity": "0-15",
+      "effective": "1"
+    },
+    {
+      "irq": 121,
+      "name": "DMAR-MSI 1-edge dmar1",
+      "affinity": "0-15",
+      "effective": "2"
+    },
+    {
+      "irq": 122,
+      "name": "IR-PCI-MSI-0000:00:06.0 0-edge PCIe PME, aerdrv, PCIe bwctrl",
+      "affinity": "0-15",
+      "effective": "3"
+    },
+    {
+      "irq": 123,
+      "name": "IR-PCI-MSI-0000:00:07.0 0-edge PCIe PME, aerdrv, pciehp",
+      "affinity": "0-15",
+      "effective": "4"
+    },
+    {
+      "irq": 124,
+      "name": "IR-PCI-MSI-0000:00:1c.0 0-edge PCIe PME, aerdrv, PCIe bwctrl",
+      "affinity": "0-15",
+      "effective": "5"
+    },
+    {
+      "irq": 125,
+      "name": "IR-PCI-MSI-0000:00:1c.5 0-edge PCIe PME, aerdrv, PCIe bwctrl",
+      "affinity": "0-15",
+      "effective": "6"
+    },
+    {
+      "irq": 126,
+      "name": "IR-PCI-MSI-0000:00:0d.0 0-edge xhci_hcd",
+      "affinity": "0-15",
+      "effective": "7"
+    },
+    {
+      "irq": 134,
+      "name": "IR-PCI-MSI-0000:00:14.0 0-edge xhci_hcd",
+      "affinity": "0-15",
+      "effective": "15"
+    },
+    {
+      "irq": 142,
+      "name": "IR-PCI-MSIX-0000:00:0d.2 0-edge thunderbolt",
+      "affinity": "0-15",
+      "effective": "11"
+    },
+    {
+      "irq": 143,
+      "name": "IR-PCI-MSIX-0000:00:0d.2 1-edge thunderbolt",
+      "affinity": "0-15",
+      "effective": "12"
+    },
+    {
+      "irq": 158,
+      "name": "IR-PCI-MSIX-0000:2c:00.0 0-edge enp44s0",
+      "affinity": "0-15",
+      "effective": "4"
+    },
+    {
+      "irq": 159,
+      "name": "IR-PCI-MSIX-0000:01:00.0 0-edge nvme0q0",
+      "affinity": "0-15",
+      "effective": "1"
+    },
+    {
+      "irq": 160,
+      "name": "IR-PCI-MSIX-0000:2d:00.0 0-edge enp45s0",
+      "affinity": "0-15",
+      "effective": "3"
+    },
+    {
+      "irq": 163,
+      "name": "IR-PCI-MSIX-0000:01:00.0 3-edge nvme0q3",
+      "affinity": "2",
+      "effective": "2"
+    },
+    {
+      "irq": 164,
+      "name": "IR-PCI-MSIX-0000:01:00.0 4-edge nvme0q4",
+      "affinity": "3",
+      "effective": "3"
+    },
+    {
+      "irq": 177,
+      "name": "IR-PCI-MSI-0000:00:0b.0 0-edge intel_vpu",
+      "affinity": "0-15",
+      "effective": "14"
+    },
+    {
+      "irq": 178,
+      "name": "IR-PCI-MSI-0000:00:16.0 0-edge mei_me",
+      "affinity": "0-15",
+      "effective": "15"
+    },
+    {
+      "irq": 179,
+      "name": "IR-PCI-MSIX-0000:00:14.3 0-edge iwlwifi:default_queue",
+      "affinity": "0-15",
+      "effective": "1"
+    },
+    {
+      "irq": 182,
+      "name": "IR-PCI-MSIX-0000:00:14.3 3-edge iwlwifi:queue_3",
+      "affinity": "2",
+      "effective": "2"
+    },
+    {
+      "irq": 183,
+      "name": "IR-PCI-MSIX-0000:00:14.3 4-edge iwlwifi:queue_4",
+      "affinity": "3",
+      "effective": "3"
+    },
+    {
+      "irq": 194,
+      "name": "IR-PCI-MSIX-0000:00:14.3 15-edge iwlwifi:exception",
+      "affinity": "0-15",
+      "effective": "0"
+    },
+    {
+      "irq": 195,
+      "name": "IR-PCI-MSI-0000:00:02.0 0-edge i915",
+      "affinity": "0-15",
+      "effective": "14"
+    },
+    {
+      "irq": 196,
+      "name": "IR-PCI-MSI-0000:00:1f.3 0-edge snd_hda_intel:card0",
+      "affinity": "0-15",
+      "effective": "15"
+    }
+  ],
+  "clock": {
+    "local": {
+      "phc": [
+        "ptp0"
+      ]
+    }
+  },
+  "queue_calibration": {
+    "rx_by_queue": {},
+    "irq_order": [
+      158
+    ]
+  }
+}

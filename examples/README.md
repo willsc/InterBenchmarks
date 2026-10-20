@@ -1,12 +1,34 @@
-# Sample report
+# Sample reports
+
+There are two complete results directories:
+
+| sample | workload |
+|---|---|
+| [`sample-loopback/`](sample-loopback/) | synthetic request/response (`--workload rpc`, the default) |
+| [`sample-app-loopback/`](sample-app-loopback/) | application mode (`--workload app`): the synthetic feed handler `rpcbench sub` restarted on CPUs 2-3 in every scenario, a built-in burst publisher at 100K and 400K msg/s, and one-way latency, drops, sequence gaps and app-core interference |
+
+The rest of this page describes `sample-loopback/`. The app sample has the
+same structure, plus its own charts (`interference`, `app-threads`, and
+`drops` when there are any) and `app.log`. It was produced with:
+
+```bash
+sudo ./irqbench.py run --workload app --iface bond0 --app-cpus 2-3 --irq-cpus 4-5 --peer local \
+     --app-cmd '{bin} sub --port {port} --threads {ncpus} --cpus {cpus} --spin --stats-file {stats}' \
+     --app-ready udp:9100 --feed builtin --feed-dest 127.0.0.1 --feed-burst 20 --latency builtin \
+     --rates 100000,400000 --reps 3 --duration 3 --warmup 0.5 --settle 0.5 --calibrate 1 \
+     --out examples/sample-app-loopback
+./irqreport.py examples/sample-app-loopback --link-images
+```
+
+## `sample-loopback/`
 
 [`sample-loopback/`](sample-loopback/) is a complete results directory from a
 real `irqbench.py` run. It shows what the benchmark produces: the HTML report,
 the PNG charts (light and dark), the Markdown/CSV summaries, and the raw
 per-run JSON.
 
-> **Format demo only. These numbers say nothing about IRQ placement.**
-> The run used `--peer local`, so the load generator was on the same host and
+> **Format demos only. Neither sample's numbers say anything about IRQ placement.**
+> Both runs used `--peer local`, so the load generator was on the same host and
 > traffic went over loopback, which never raises NIC interrupts. The report
 > says this at the top. For real results, run against a separate load
 > generator, for example a second AWS metal instance in the same cluster
