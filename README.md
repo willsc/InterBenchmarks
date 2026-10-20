@@ -60,17 +60,18 @@ frequency drift doesn't favour one scenario.
 
 ```bash
 make
-sudo ./irqbench.py show --iface bond0          # IRQs, affinity, RPS, P/E cores
+sudo ./irqbench.py show --iface ens6           # ENA queue IRQs, affinity, RPS, NUMA, SMT
 
 # dry run: print the plan only
-sudo ./irqbench.py run --iface bond0 --app-cpus 2-3 --irq-cpus 4-5 \
-     --peer ssh:user@loadgen --dry-run
+sudo ./irqbench.py run --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
+     --peer ssh:ec2-user@10.0.1.20 --dry-run
 
-sudo ./irqbench.py run --iface bond0 --app-cpus 2-3 --irq-cpus 4-5 \
-     --peer ssh:user@loadgen --deploy --client-cpus 0-3 --client-threads 4 \
+sudo ./irqbench.py run --iface ens6 --app-cpus 8-11 --irq-cpus 2-5 \
+     --peer ssh:ec2-user@10.0.1.20 --deploy --client-cpus 0-3 --client-threads 4 \
      --rates 10000,50000,100000,0 --reps 5 --duration 10
 
 ./irqbench.py report results/<timestamp>        # regenerate summary
+# step-by-step guide for real runs on AWS: examples/REAL-BENCHMARKS.md
 sudo ./irqbench.py restore                      # only if a run was killed -9
 ```
 
