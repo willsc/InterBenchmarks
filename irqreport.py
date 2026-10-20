@@ -20,7 +20,10 @@ import os
 import statistics
 import sys
 
-SCENARIOS = ("default", "same", "separate", "same-wide", "smt-sibling")
+SCENARIOS = ("default", "same", "separate", "same-wide", "smt-sibling", "remote-numa")
+# the proximity ladder: where the interrupts run relative to the application thread
+LADDER = [("same", "same core"), ("smt-sibling", "hyperthread sibling"),
+          ("separate", "other core, same socket"), ("remote-numa", "other socket")]
 # Color follows the scenario, never its rank.  Slots 1-4 of the validated
 # categorical palette; "default" is the baseline and is drawn de-emphasised.
 THEMES = {
@@ -28,16 +31,21 @@ THEMES = {
         "surface": "#fcfcfb", "page": "#f9f9f7", "ink": "#0b0b0b", "ink2": "#52514e",
         "muted": "#898781", "grid": "#e1e0d9", "axis": "#c3c2b7", "mid": "#f0efec",
         "series": {"default": "#898781", "same": "#2a78d6", "separate": "#eb6834",
-                   "same-wide": "#1baf7a", "smt-sibling": "#eda100"},
+                   "same-wide": "#1baf7a", "smt-sibling": "#eda100",
+                   "remote-numa": "#e87ba4"},
     },
     "dark": {
         "surface": "#1a1a19", "page": "#0d0d0d", "ink": "#f0efec", "ink2": "#c3c2b7",
         "muted": "#898781", "grid": "#2c2c2a", "axis": "#383835", "mid": "#383835",
         "series": {"default": "#898781", "same": "#3987e5", "separate": "#d95926",
-                   "same-wide": "#199e70", "smt-sibling": "#c98500"},
+                   "same-wide": "#199e70", "smt-sibling": "#c98500",
+                   "remote-numa": "#d55181"},
     },
 }
-MARKERS = {"default": "o", "same": "s", "separate": "D", "same-wide": "^", "smt-sibling": "v"}
+MARKERS = {"default": "o", "same": "s", "separate": "D", "same-wide": "^", "smt-sibling": "v", "remote-numa": "P"}
+# ordinal ramps for load levels (validated: light->dark on light, dark->light on dark)
+LOAD_RAMP = {"light": ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"],
+             "dark": ["#184f95", "#256abf", "#3987e5", "#6da7ec", "#9ec5f4"]}
 BLUE_RAMP = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
 RED = "#e34948"
 SPECTRUM = [("p50_ns", "p50", 50), ("p90_ns", "p90", 90), ("p99_ns", "p99", 99),
@@ -120,6 +128,7 @@ METRICS = {  # key: (label or {workload: label}, accessor, decimals, better)
     "nivcsw": ("involuntary ctx switches", nivcsw, 0, "lower"),
     "wait_us": ("app run-queue wait (µs)", lambda r: g(r, "app", "wait_us"), 1, "lower"),
     "shaped": ("AWS allowance exceeded", allowance, 0, "lower"),
+    "proximity": ("NIC IRQs on app-thread cores (%)", lambda r: g(r, "proximity", "pct"), 1, "higher"),
 }
 LOAD_LABELS = {}
 
@@ -227,8 +236,9 @@ def charts(data, outdir):
     made = []
     for mode in data.modes:
         suffix = f"-{mode}" if len(data.modes) > 1 else ""
+        ladder = [("proximity-ladder", f"What distance costs ({mode})", chart_ladder)]
         if data.workload == "app":
-            builders = [
+            builders = ladder + [
                 ("latency-vs-load", f"Latency vs feed rate ({mode})", chart_latency_vs_load),
                 ("delta-vs-same", f"Change vs `same` ({mode})", chart_delta),
                 ("percentile-spectrum", f"Latency percentile spectrum ({mode})", chart_spectrum),
@@ -238,7 +248,7 @@ def charts(data, outdir):
                 ("irq-placement", f"Where NIC interrupts landed ({mode})", chart_irq_placement),
             ]
         else:
-            builders = [
+            builders = ladder + [
                 ("latency-vs-load", f"Client latency vs offered load ({mode} server)", chart_latency_vs_load),
                 ("throughput", f"Maximum throughput, closed loop ({mode} server)", chart_throughput),
                 ("delta-vs-same", f"Change vs `same` ({mode} server)", chart_delta),
@@ -284,6 +294,10 @@ CAPTIONS = {
     "app-threads": "Summed over the app's busy threads (≥5% CPU): involuntary context switches and "
                    "time spent runnable but waiting for a CPU (schedstat), both of which mean the thread "
                    "was pushed off its core.",
+    "proximity-ladder": "Each line is one load level (darker = higher). Left to right the interrupts move "
+                        "further from the application thread: same core, its hyperthread sibling, another "
+                        "core on the same socket, the other socket. Median across repetitions, whiskers "
+                        "min–max. A line that rises to the right means proximity helps.",
     "irq-placement": "Share of NIC interrupts per CPU at the highest load. This checks that each "
                      "scenario put the interrupts where intended.",
 }
@@ -620,6 +634,49 @@ def chart_cpu(data, mode, t):
     return finish(fig)
 
 
+def chart_ladder(data, mode, t):
+    m = data.primary if data.has("p99") else None
+    levels = [(s, lbl) for s, lbl in LADDER if s in data.scenarios]
+    if not m or len(levels) < 2 or "same" not in data.scenarios:
+        return None
+    rates = data.rates(mode)
+    if len(rates) > 5:  # ordinal ramp has 5 steps: keep an even spread of loads
+        idx = sorted({round(i * (len(rates) - 1) / 4) for i in range(5)})
+        rates = [rates[i] for i in idx]
+    theme = "light" if t is THEMES["light"] else "dark"
+    ramp = LOAD_RAMP[theme]
+    pick = [ramp[round(i * (len(ramp) - 1) / max(1, len(rates) - 1))] for i in range(len(rates))] \
+        if len(rates) > 1 else [ramp[2]]
+    fig, axes = new_fig(t, 1, w=max(6.5, 1.9 * len(levels) + 2.5), h=3.6,
+                        title=f"What distance costs: {data.label(m)} by where the interrupts run")
+    ax = axes[0][0]
+    xs = list(range(len(levels)))
+    from matplotlib.lines import Line2D
+    handles = []
+    for r, c in zip(rates, pick):
+        pts = [(x, data.stat(mode, r, s, m)) for x, (s, _) in zip(xs, levels)]
+        pts = [(x, st) for x, st in pts if st]
+        if not pts:
+            continue
+        ax.errorbar([x for x, _ in pts], [st[0] for _, st in pts],
+                    yerr=[[st[0] - st[1] for _, st in pts], [st[2] - st[0] for _, st in pts]],
+                    color=c, linewidth=2, marker="o", markersize=7, markeredgecolor=t["surface"],
+                    markeredgewidth=1.5, elinewidth=1, capsize=0, zorder=3)
+        handles.append(Line2D([0], [0], color=c, marker="o", linewidth=2, markersize=6,
+                              markeredgecolor=t["surface"], label=fmt_rate(r)))
+    ax.set_xticks(xs)
+    ax.set_xticklabels([f"{lbl}\n({s})" for s, lbl in levels], fontsize=8.5)
+    ax.set_xlim(-0.3, len(levels) - 0.7)
+    ax.set_ylim(bottom=0)
+    style_axes(ax, t, xlabel="where the NIC interrupts run, nearest → farthest from the app thread",
+               ylabel="µs")
+    leg = fig.legend(handles=handles, loc="outside lower center", ncol=len(handles), frameon=False,
+                     fontsize=9, title="load", title_fontsize=9)
+    for txt in leg.get_texts() + [leg.get_title()]:
+        txt.set_color(t["ink2"])
+    return finish(fig)
+
+
 def chart_irq_placement(data, mode, t):
     rates = data.rates(mode, closed=False) or data.rates(mode)
     if not rates:
@@ -794,6 +851,21 @@ def scenario_info(runs, meta):
                 cons="The sibling still competes for the core's execution units and cache, so it isolates "
                      "less than `separate`.",
                 irq_cpus=ic or [])
+        elif name == "remote-numa":
+            info = dict(
+                headline="Far end of the ladder: interrupts on the other socket",
+                setup=f"Server threads are on the app CPUs ({cpus_str(srv)}). NIC interrupts are on CPUs of "
+                      f"another NUMA node ({cpus_str(ic or [])}), as far from the app as this host allows.",
+                question="What does distance cost? Compared with `separate` (same socket), this shows how much "
+                         "worse it gets when packet processing crosses the socket interconnect.",
+                pros="The app cores stay free of interrupt work, like `separate`.",
+                cons="Packet data and socket state cross between sockets, and the NIC may DMA into memory "
+                     "that is remote to the CPU handling it. Usually the slowest placement; real hosts "
+                     "end up here by accident when IRQ affinity isn't managed.",
+                irq_cpus=ic or [])
+        if name == "same":
+            info["setup"] += (" The report checks how much of the interrupt work actually landed on the cores "
+                              "running the busy application threads (\"proximity achieved\").")
         if app_mode:
             for k in ("setup", "pros", "cons", "question"):
                 info[k] = (info[k].replace("Server threads are pinned to", "The application's threads run on")
@@ -872,6 +944,81 @@ def findings(data):
     return out
 
 
+def decision_metrics(data):
+    """Priority order for the verdict: missed data first, then the latency tail."""
+    order = (["drops", "gaps"] if data.workload == "app" else ["lost"]) + ["p99", "p999"]
+    return [m for m in order if data.has(m)]
+
+
+def verdict(data):
+    """Proximity (same) vs separate cores, per load: who wins, on what, by how much, how sure."""
+    order = decision_metrics(data)
+    shown = "p99" if data.has("p99") else (order[0] if order else None)
+    rows = []
+    for mode in data.modes:
+        for r in data.rates(mode):
+            if not data.groups.get((mode, r, "same")) or not data.groups.get((mode, r, "separate")):
+                continue
+            row = {"mode": mode, "rate": r, "metric": shown,
+                   "same": data.stat(mode, r, "same", shown) if shown else None,
+                   "separate": data.stat(mode, r, "separate", shown) if shown else None,
+                   "winner": "none", "decided_by": None, "advantage": None, "clear": False,
+                   "reps": min(len(data.groups[(mode, r, "same")]), len(data.groups[(mode, r, "separate")]))}
+            for m in order:
+                a, b = data.stat(mode, r, "same", m), data.stat(mode, r, "separate", m)
+                if not a or not b or row["reps"] < 2 or a[0] == b[0]:
+                    continue
+                if not (b[1] > a[2] or b[2] < a[1]):
+                    continue  # ranges overlap: not decisive, try the next metric
+                lower = METRICS[m][3] == "lower"
+                same_better = (a[0] < b[0]) if lower else (a[0] > b[0])
+                loser, best = (b[0], a[0]) if same_better else (a[0], b[0])
+                row.update(winner="same" if same_better else "separate", decided_by=m, clear=True,
+                           advantage=100.0 * abs(loser - best) / loser if loser else None)
+                break
+            if row["winner"] == "separate" and data.stat(mode, r, "same-wide", row["decided_by"]):
+                c = data.compare(mode, r, "separate", row["decided_by"], base="same-wide")
+                row["fairness"] = ("isolation itself helps (separate also beats same-wide)" if c and c[1] and c[0] < 0
+                                   else "the gain comes from extra cores: same-wide does as well")
+            row["secondary"] = {k: data.compare(mode, r, "separate", k)
+                                for k in ("p999", "drops", "rps" if data.workload == "rpc" else "app_ints")
+                                if data.has(k) and k != shown}
+            px = data.stat(mode, r, "same", "proximity")
+            row["proximity"] = px[0] if px else None
+            rows.append(row)
+    return rows
+
+
+def verdict_headline(data, rows):
+    if not rows:
+        return ("No verdict: the results need both `same` and `separate` at the same load.", "muted")
+    if not decision_metrics(data):
+        return ("No latency source was configured and nothing was dropped, so this run can't say which "
+                "placement is faster. See the interference evidence below, or re-run with --latency.", "muted")
+    by = {"same": [], "separate": [], "none": []}
+    for r in rows:
+        tag = fmt_rate(r["rate"]) + (f" (on {data.label(r['decided_by'])})" if r["decided_by"] else "")
+        by[r["winner"] or "none"].append(tag)
+    metric = " → ".join(data.label(m) for m in decision_metrics(data))
+    if by["same"] and not by["separate"] and not by["none"]:
+        return (f"Interrupt proximity is better: `same` beats separate cores at every load tested: "
+                f"{', '.join(by['same'])}.", "good")
+    if by["separate"] and not by["same"] and not by["none"]:
+        return (f"Separate interrupt cores are better: they beat proximity at every load tested: "
+                f"{', '.join(by['separate'])}.", "good")
+    if by["none"] and not by["same"] and not by["separate"]:
+        return (f"No clear difference between proximity and separate cores at any load tested "
+                f"(checked in order: {metric}).", "muted")
+    parts = []
+    if by["same"]:
+        parts.append(f"proximity wins at {', '.join(by['same'])}")
+    if by["separate"]:
+        parts.append(f"separate cores win at {', '.join(by['separate'])}")
+    if by["none"]:
+        parts.append(f"no clear difference at {', '.join(by['none'])}")
+    return ("It depends on load: " + "; ".join(parts) + ".", "warn")
+
+
 def warnings_for(data):
     out = []
     for r in data.runs:
@@ -928,6 +1075,13 @@ def warnings_for(data):
                                 "latency carries that error"))
     for s, why in (data.meta.get("skipped_scenarios") or {}).items():
         out.append(("warning", f"scenario {s} was not run: {why}"))
+    for mode in data.modes:
+        for r in data.rates(mode):
+            px = data.stat(mode, r, "same", "proximity")
+            if px and px[0] < 80:
+                out.append(("serious", f"`same` at {fmt_rate(r)} ({mode}): only {px[0]:.0f}% of NIC interrupts fired "
+                            "on cores running a busy app thread, so `same` did not achieve real proximity and "
+                            "understates it. Map queues to the threads that read them with --irq-map."))
     return out
 
 
@@ -988,6 +1142,7 @@ nav a{color:var(--ink2);margin-right:14px;font-size:13px}
 .tag{display:block;border-radius:4px;padding:0 5px;margin-top:3px;font-size:11px;font-weight:600}
 .tag.app{background:var(--app-bg);color:var(--app-ink)}.tag.irq{background:var(--irq-bg);color:var(--irq-ink)}
 .cpu.idle{opacity:.45}
+.headline{font-size:18px;font-weight:600;margin:4px 0 8px}
 """
 
 JS = """
@@ -1036,7 +1191,7 @@ def build_html(data, outdir, made, embed=True):
     parts.append(f"<h1>IRQ placement benchmark</h1><p class='sub'>{esc(title_host)} · "
                  f"{esc(meta.get('started', os.path.basename(os.path.abspath(outdir))))} · "
                  f"{len(data.runs)} runs</p>")
-    parts.append("<nav><a href='#scenarios'>Scenarios</a><a href='#findings'>Findings</a><a href='#charts'>Charts</a>"
+    parts.append("<nav><a href='#verdict'>Verdict</a><a href='#scenarios'>Scenarios</a><a href='#findings'>Findings</a><a href='#charts'>Charts</a>"
                  "<a href='#summary'>Summary table</a><a href='#setup'>Setup</a><a href='#runs'>Raw runs</a></nav>")
 
     # warnings
@@ -1047,6 +1202,60 @@ def build_html(data, outdir, made, embed=True):
         more = f"<p class='muted'>…and {len(warns) - 40} more</p>" if len(warns) > 40 else ""
         parts.append(f"<div class='card'><h3>Data quality warnings ({len(warns)})</h3>"
                      f"<ul class='warn-list'>{items}</ul>{more}</div>")
+
+    # verdict: the question the benchmark exists to answer
+    vrows = verdict(data)
+    head, cls = verdict_headline(data, vrows)
+    parts.append(f"<h2 id='verdict'>Verdict: interrupt proximity vs separate cores</h2>"
+                 f"<div class='card'><p class='headline {cls}'>{md_code(head)}</p>"
+                 "<p class='sub'><b>Proximity</b> (<code>same</code>) runs NIC interrupts on the application's own "
+                 "cores. <b>Separate</b> runs them on dedicated cores. Each load is decided by the first of "
+                 f"these that differs clearly (non-overlapping min–max across repetitions): "
+                 f"{esc(' → '.join(data.label(m) for m in decision_metrics(data)) or 'none available')}. "
+                 "Missed data comes first because a feed handler that drops updates has failed, however "
+                 "fast it is.</p>")
+    if vrows and vrows[0]["metric"]:
+        m = vrows[0]["metric"]
+        show_fair = any(r.get("fairness") for r in vrows)
+        sec_keys = [k for k in ("p999", "drops", "rps", "app_ints") if any(k in r["secondary"] for r in vrows)]
+        th = "".join(f"<th>{esc(data.label(k))}: separate vs same</th>" for k in sec_keys)
+        parts.append("<div class='tablewrap'><table><thead><tr><th class='l'>load</th>"
+                     f"<th>proximity (same)<br>{esc(data.label(m))}</th><th>separate cores<br>{esc(data.label(m))}</th>"
+                     f"<th class='l'>verdict</th>{th}<th>proximity achieved</th>"
+                     + ("<th class='l'>why separate won</th>" if show_fair else "") + "</tr></thead><tbody>")
+        for r in vrows:
+            v_same, v_sep = r["same"], r["separate"]
+            on = f" on {esc(data.label(r['decided_by']))}" if r["decided_by"] else ""
+            if r["winner"] == "same":
+                v = f"<b class='good'>proximity, {r['advantage']:.0f}% better{on}</b>"
+            elif r["winner"] == "separate":
+                v = f"<b class='good'>separate, {r['advantage']:.0f}% better{on}</b>"
+            elif r["reps"] < 2:
+                v = "<span class='muted'>need ≥2 reps</span>"
+            else:
+                v = "<span class='muted'>no clear difference</span>"
+            cells = ""
+            for k in sec_keys:
+                c = r["secondary"].get(k)
+                if not c:
+                    cells += "<td>–</td>"
+                    continue
+                good = c[0] > 0 if METRICS[k][3] == "higher" else c[0] < 0
+                cells += (f"<td class='{('good' if good else 'bad') if c[1] else 'muted'}'>"
+                          f"{c[0]:+.1f}%{' ●' if c[1] else ''}</td>")
+            px = r["proximity"]
+            pxc = "" if px is None else ("bad" if px < 80 else "")
+            dec = METRICS[m][2]
+            parts.append(f"<tr><td class='l'>{esc(r['mode'])} · {esc(fmt_rate(r['rate']))}</td>"
+                         f"<td>{fmt_num(v_same[0], dec) if v_same else '–'}</td><td>{fmt_num(v_sep[0], dec) if v_sep else '–'}</td>"
+                         f"<td class='l'>{v}</td>{cells}<td class='{pxc}'>{fmt_num(px, 0) + '%' if px is not None else '–'}</td>"
+                         + (f"<td class='l' style='white-space:normal'>{esc(r.get('fairness', ''))}</td>" if show_fair else "")
+                         + "</tr>")
+        parts.append("</tbody></table></div><p class='muted'>Secondary columns: + means separate is higher than "
+                     "same; ● = clear. Proximity achieved = share of NIC interrupts in <code>same</code> that fired "
+                     "on a core running a busy application thread (under 80% means <code>same</code> wasn't really "
+                     "proximity).</p>")
+    parts.append("</div>")
 
     # scenario explanations
     info = scenario_info(data.runs, meta)
@@ -1283,9 +1492,10 @@ def build_html(data, outdir, made, embed=True):
 def summary_keys(workload):
     if workload == "app":
         return ["rps", "p50", "p99", "p999", "p9999", "max", "drops", "gaps", "app_ints", "app_nic_ints",
-                "app_other_ints", "app_netrx", "app_irqsoft", "nivcsw", "wait_us", "work_p99", "on_target", "shaped"]
+                "app_other_ints", "app_netrx", "app_irqsoft", "nivcsw", "wait_us", "work_p99", "proximity",
+                "on_target", "shaped"]
     return ["rps", "p50", "p99", "p999", "p9999", "svc_p50", "svc_p99", "work_p99", "lost",
-            "app_busy", "app_irqsoft", "irq_cores_busy", "on_target", "nivcsw", "shaped"]
+            "app_busy", "app_irqsoft", "irq_cores_busy", "proximity", "on_target", "nivcsw", "shaped"]
 
 
 def compare_keys(data):
@@ -1347,6 +1557,25 @@ def write_summary(outdir):
     if data.workload == "app" and data.has("drops"):
         lines += ["⛔ Some runs dropped packets or missed sequence numbers." if any_nonzero(data, ("drops", "gaps"))
                   else "✓ No packet drops or sequence gaps in any run.", ""]
+    vrows = verdict(data)
+    head, _ = verdict_headline(data, vrows)
+    lines += ["## Verdict: interrupt proximity vs separate cores", "", f"**{head}**", "",
+              "Each load is decided by the first metric that differs clearly between `same` and `separate`: "
+              + " → ".join(data.label(m) for m in decision_metrics(data)) + ".", ""]
+    if vrows and vrows[0]["metric"]:
+        m = vrows[0]["metric"]
+        lines += [f"| load | proximity (same) {data.label(m)} | separate {data.label(m)} | verdict | "
+                  "proximity achieved | why separate won |", "|---|---|---|---|---|---|"]
+        for r in vrows:
+            a, b = r["same"], r["separate"]
+            on = f" on {data.label(r['decided_by'])}" if r["decided_by"] else ""
+            v = (f"proximity, {r['advantage']:.0f}% better{on}" if r["winner"] == "same" else
+                 f"separate, {r['advantage']:.0f}% better{on}" if r["winner"] == "separate" else
+                 "need ≥2 reps" if r["reps"] < 2 else "no clear difference")
+            px = f"{r['proximity']:.0f}%" if r["proximity"] is not None else "–"
+            lines.append(f"| {r['mode']} · {fmt_rate(r['rate'])} | {fmt_num(a[0], METRICS[m][2]) if a else '–'} | "
+                         f"{fmt_num(b[0], METRICS[m][2]) if b else '–'} | {v} | {px} | {r.get('fairness', '')} |")
+        lines.append("")
     lines.append(scenario_markdown(runs, meta))
     lines += ["## Results", ""]
     hdr = ["mode", "load", "scenario", "reps"] + [data.label(k) for k in keys]

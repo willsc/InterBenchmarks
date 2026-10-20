@@ -16,22 +16,43 @@ accounting that shows where the interrupts actually landed.
 | `irqreport.py` | Builds the HTML report and PNG charts from a results directory. `irqbench.py` runs it automatically, and you can also run it on its own on any machine. |
 | `irqbench.py` | Orchestrator for the machine under test (DUT). It applies each placement, runs the load, collects `/proc/interrupts`, `/proc/softirqs` and `/proc/stat` deltas, restores the original state, and writes a report. |
 
-## Scenarios
+## The question, and the scenarios that answer it
+
+**Is it better to run NIC interrupts close to the application (`same`) or on
+separate cores (`separate`)?** Every report opens with that verdict, given for
+each load. Each load is decided by the first metric that differs clearly
+between the two:
+
+1. missed data: drops and sequence gaps (lost requests for RPC);
+2. p99 latency;
+3. p99.9 latency.
+
+"Clearly" means the repetitions' min–max ranges don't overlap. The verdict
+says which metric decided each load and where the answer changes with load.
 
 `APP` = `--app-cpus`, `IRQ` = `--irq-cpus` (they must not overlap).
 
-| scenario | server threads | NIC IRQs + RPS |
-|---|---|---|
-| `default` | APP | left as found (baseline) |
-| `same` | APP | APP, one IRQ per core, round robin |
-| `separate` | APP | IRQ cores |
-| `same-wide` | APP ∪ IRQ (one thread per core) | APP ∪ IRQ |
-| `smt-sibling` | APP | the hyperthread siblings of APP |
+| scenario | app / server threads | NIC IRQs + RPS | role |
+|---|---|---|---|
+| `same` | APP | APP, one IRQ per core, round robin | **proximity**: the first half of the question |
+| `separate` | APP | IRQ cores (same socket) | **separate cores**: the other half |
+| `same-wide` | APP ∪ IRQ (one thread per core) | APP ∪ IRQ | fairness check: does `separate` win from isolation or just from extra cores? |
+| `smt-sibling` | APP | the hyperthread siblings of APP | proximity ladder: own logical CPU, shared physical core |
+| `remote-numa` | APP | cores on another NUMA node (`--remote-cpus`, or auto) | proximity ladder: the far end, across the socket interconnect |
+| `default` | APP | left as found | baseline: what an untuned host does |
 
-`separate` uses more cores than `same`. `same-wide` is the equal-budget
-control: "is it better to dedicate N cores to interrupts, or to share all the
-cores?" Scenario order is shuffled within each repetition so that thermal or
-frequency drift doesn't favour one scenario.
+The default is `--scenarios same,separate,same-wide`. Add
+`smt-sibling,remote-numa` for the full **proximity ladder** (same core →
+sibling → same socket → other socket), which gets its own chart, "what
+distance costs". Scenarios the host can't run (no SMT, a single NUMA node, an
+attached app that can't grow for `same-wide`) are skipped and the report says
+why.
+
+**Proximity achieved:** every run records what share of NIC interrupts fired
+on a core running a busy application thread. If `same` falls below 80%, it
+wasn't really proximity, and the report says so. Fix it with `--irq-map`
+(app mode) or CPU steering (RPC mode). Scenario order is shuffled within each
+repetition so that thermal or frequency drift doesn't favour one scenario.
 
 ## What is measured
 
@@ -285,7 +306,7 @@ Example for a two-socket metal host where `ens6` (a secondary ENI) is on node
 
 ```bash
 sudo ./irqbench.py run --iface ens6 --app-cpus 4-7 --irq-cpus 8-11 \
-     --scenarios default,same,separate,same-wide,smt-sibling \
+     --scenarios same,separate,same-wide,smt-sibling,remote-numa \
      --peer ssh:ec2-user@10.0.1.20 --deploy --server-addr 10.0.2.15 \
      --client-threads 8 --client-cpus 2-9 --conns 32 \
      --rates 50000,200000,500000,0 --reps 5 --stop-irqbalance

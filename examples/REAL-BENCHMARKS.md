@@ -1,8 +1,10 @@
 # Running real benchmarks
 
-This is a step-by-step runbook for answering the real question: **should NIC
-interrupts share the market-data application's isolated cores, or have cores
-of their own?** It assumes two AWS metal instances and a feed handler on
+This is a step-by-step runbook for answering the real question: **is it better
+to run NIC interrupts close to the market-data application (on its own
+isolated cores), or on separate cores?** Every report opens with that verdict
+for each load, and says which metric decided it: drops and gaps first, then
+p99, then p99.9. It assumes two AWS metal instances and a feed handler on
 isolated cores that receives over kernel sockets. The same steps work on any
 two Linux hosts.
 
@@ -132,6 +134,10 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
 
 In `results/rehearsal/report.html`, check:
 
+- **Verdict: "proximity achieved" for `same`** is close to 100%. Below 80%,
+  the interrupts didn't land on the cores of the threads reading the feed, so
+  set `--irq-map`.
+
 - **IRQ placement chart:** `same` puts interrupts on 8-11, `separate` on 2-5.
 - **Warnings:** no "AWS allowance exceeded", no "load generator fell behind",
   no "IRQs not on target".
@@ -152,7 +158,7 @@ sudo --preserve-env=SSH_AUTH_SOCK ./irqbench.py run --workload app \
   --rates 1x,2x,4x \
   --latency http://127.0.0.1:9464/metrics --latency-metric md_feed_to_handler_seconds \
   --reps 7 --duration 30 --warmup 5 --settle 2 \
-  --scenarios default,same,separate,smt-sibling \
+  --scenarios same,separate,smt-sibling,remote-numa \
   --stop-irqbalance --out results/real-pcap-prom
 ```
 
@@ -246,9 +252,13 @@ Open `report.html` and read it in this order:
    flag.
 2. **What "latency" means in this run:** know which part of the path you
    measured.
-3. **Findings:** for each feed rate, the scenario with the lowest p99, and
-   whether each difference vs `same` is clear or within noise.
-4. **Charts:**
+3. **Verdict: interrupt proximity vs separate cores:** for each feed rate,
+   who wins, by how much, and on which metric. Then "proximity achieved", and
+   for `separate` wins, whether `same-wide` shows the gain is isolation or
+   just extra cores.
+4. **What distance costs:** the ladder chart, from same core → sibling →
+   same socket → other socket.
+5. **Charts:**
    - `interference`: interrupts per second landing on the isolated cores.
    - `drops`: missed updates.
    - `app-threads`: involuntary context switches and run-queue wait.

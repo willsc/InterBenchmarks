@@ -33,6 +33,17 @@
 
 ⛔ Some runs dropped packets or missed sequence numbers.
 
+## Verdict: interrupt proximity vs separate cores
+
+**It depends on load: proximity wins at 100K msg/s (on latency p99 (µs)); no clear difference at 400K msg/s.**
+
+Each load is decided by the first metric that differs clearly between `same` and `separate`: dropped packets → sequence gaps → latency p99 (µs) → latency p99.9 (µs).
+
+| load | proximity (same) latency p99 (µs) | separate latency p99 (µs) | verdict | proximity achieved | why separate won |
+|---|---|---|---|---|---|
+| app (restart per scenario) · 100K msg/s | 4.2 | 5.8 | proximity, 29% better on latency p99 (µs) | – |  |
+| app (restart per scenario) · 400K msg/s | 13.4 | 7.1 | no clear difference | – |  |
+
 ## What the scenarios mean
 
 ### `default`: Baseline: leave interrupts wherever the system put them
@@ -44,7 +55,7 @@
 
 ### `same`: Co-located: application and interrupts share the same cores
 
-- **Setup:** The application and the NIC interrupts are both on the app CPUs (2-3). Each interrupt is pinned to one of those CPUs, round robin. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too.
+- **Setup:** The application and the NIC interrupts are both on the app CPUs (2-3). Each interrupt is pinned to one of those CPUs, round robin. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too. The report checks how much of the interrupt work actually landed on the cores running the busy application threads ("proximity achieved").
 - **Question it answers:** Is it better to keep packet processing and the application on one core?
 - **Expected upside:** The packet's data is still in that core's cache when the app reads it. There's no cross-core wake-up, because the interrupt wakes the core that will run the app. It uses the fewest cores. On isolated cores the packet is processed on the core whose thread reads it, provided the busiest queue's IRQ lands on the right core (see --irq-map).
 - **Expected downside:** Interrupt and softirq work steals cycles from the application and evicts its cache. Under heavy load the network stack and the app compete for the same CPU, which usually shows up as a worse tail (p99/p99.9) and higher service time. On isolated cores this deliberately breaks the isolation: every NIC interrupt stalls a busy-polling feed-handler thread while it runs.

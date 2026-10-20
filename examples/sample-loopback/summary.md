@@ -19,6 +19,19 @@
 - ⚠ rep 2, 100K, default (block): 0.80% requests lost
 - ⚠ rep 2, 100K, same-wide (block): the load generator fell 1.2 ms behind schedule, so it may be the bottleneck
 
+## Verdict: interrupt proximity vs separate cores
+
+**No clear difference between proximity and separate cores at any load tested (checked in order: loss (%) → RTT p99 (µs) → RTT p99.9 (µs)).**
+
+Each load is decided by the first metric that differs clearly between `same` and `separate`: loss (%) → RTT p99 (µs) → RTT p99.9 (µs).
+
+| load | proximity (same) RTT p99 (µs) | separate RTT p99 (µs) | verdict | proximity achieved | why separate won |
+|---|---|---|---|---|---|
+| block · 10K | 495.6 | 495.6 | no clear difference | – |  |
+| block · 40K | 892.9 | 520.2 | no clear difference | – |  |
+| block · 100K | 23.8 | 165.9 | no clear difference | – |  |
+| block · closed loop | 103.4 | 99.3 | no clear difference | – |  |
+
 ## What the scenarios mean
 
 ### `default`: Baseline: leave interrupts wherever the system put them
@@ -30,7 +43,7 @@
 
 ### `same`: Co-located: application and interrupts share the same cores
 
-- **Setup:** Server threads and NIC interrupts are both on the app CPUs (2-3). Each interrupt is pinned to one of those CPUs, round robin. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too. CPU steering is on, so every request goes to the server thread on the same CPU that processed its packet in the kernel.
+- **Setup:** Server threads and NIC interrupts are both on the app CPUs (2-3). Each interrupt is pinned to one of those CPUs, round robin. RPS (software receive steering) is set to the same CPUs as the interrupts, so protocol processing runs there too. CPU steering is on, so every request goes to the server thread on the same CPU that processed its packet in the kernel. The report checks how much of the interrupt work actually landed on the cores running the busy application threads ("proximity achieved").
 - **Question it answers:** Is it better to keep packet processing and the application on one core?
 - **Expected upside:** The packet's data is still in that core's cache when the app reads it. There's no cross-core wake-up, because the interrupt wakes the core that will run the app. It uses the fewest cores.
 - **Expected downside:** Interrupt and softirq work steals cycles from the application and evicts its cache. Under heavy load the network stack and the app compete for the same CPU, which usually shows up as a worse tail (p99/p99.9) and higher service time.

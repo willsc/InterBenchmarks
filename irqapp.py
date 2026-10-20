@@ -1027,14 +1027,19 @@ class AppWorkload:
                  "nic_rx_dropped": sum(v for k, v in dd.items() if k.endswith(("rx_dropped", "rx_missed_errors",
                                                                                 "rx_fifo_errors", "rx_over_errors")))}
         extra = (latency or {}).get("extra") or {}
+        sysd = ib.counter_delta(before, after, srv_cpus, target)
+        tdelta = thread_delta(thr0, thr1, self.hz, secs)
+        hot_cpus = sorted({t["last_cpu"] for t in tdelta["threads"] if t["cpu_pct"] >= 5}) or list(srv_cpus)
         feed = {"rx_msgs_per_s": round(sd.get("Udp.InDatagrams", 0) / secs, 1),
                 "nic_rx_pps": round(rx_pkts / secs, 1), "udp_in_datagrams": sd.get("Udp.InDatagrams", 0),
                 "drops": drops, "drops_total": sum(drops.values()) - drops["udp_no_ports"],
                 "gaps": extra.get("gaps"), "queues_rx": qd, "publisher": feed_res, "window_s": round(secs, 3)}
         rec = {"workload": "app", "load_label": load[1], "latency": latency,
                "latency_source": self.lat.name, "feed": feed,
-               "app": thread_delta(thr0, thr1, self.hz, secs),
-               "system": ib.counter_delta(before, after, srv_cpus, target),
+               "app": tdelta,
+               "system": sysd,
+               "proximity": ib.proximity(sysd, hot_cpus, "interrupt on a core running a busy app thread "
+                                         "(≥5% CPU); /proc can't show which thread read which packet"),
                "interference": interference(ints0, ints1, soft0, soft1, srv_cpus, nic.irqs, secs),
                "nic_stats": ib.nic_stats_delta(nic0, nic1)}
         if self.lat.name == "ptp" or (self.lat.name == "builtin" and not self.peer.local):

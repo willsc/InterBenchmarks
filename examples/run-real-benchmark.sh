@@ -43,7 +43,7 @@ STATS_UNIT=${STATS_UNIT-us}
 REPS=${REPS-7}
 DURATION=${DURATION-30}
 WARMUP=${WARMUP-5}
-SCENARIOS=${SCENARIOS-default,same,separate,smt-sibling}
+SCENARIOS=${SCENARIOS-same,separate,smt-sibling,remote-numa}   # the proximity ladder
 # --------------------------------------------------------------------------
 
 cd "$(dirname "$0")/.."
@@ -109,7 +109,7 @@ phase_ptp() {         # one-way wire -> kernel latency, no app integration
 phase_samewide() {    # restart the app per scenario so same-wide (equal core budget) can run
     bench --workload app "${COMMON[@]}" --app-cpus "$APP_CPUS" --app-cmd "$APP_CMD" \
         --app-ready "$APP_READY" --app-ready-timeout 120 --feed "pcap:$PCAP" --rates 1x,4x \
-        "${LATENCY[@]}" --scenarios default,same,separate,same-wide --warmup 10 --reps 5 \
+        "${LATENCY[@]}" --scenarios same,separate,same-wide --warmup 10 --reps 5 \
         --out "results/$STAMP-samewide"
 }
 

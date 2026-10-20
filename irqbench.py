@@ -11,6 +11,12 @@ Scenarios (APP = --app-cpus, IRQ = --irq-cpus):
              (same total core budget as "separate", but shared)
   smt-sibling application on APP, NIC IRQs (+RPS) on the hyperthread
              siblings of APP (separate logical CPUs, shared physical cores)
+  remote-numa application on APP, NIC IRQs (+RPS) on cores of another NUMA
+             node (the far end of the proximity ladder)
+
+The question: is interrupt *proximity* to the application (same) better than
+interrupts on *separate* cores?  The report leads with that verdict; the
+ladder same -> smt-sibling -> separate -> remote-numa shows what distance costs.
 
 Workloads (--workload):
   rpc       synthetic request/response server + load generator (default)
@@ -42,7 +48,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCENARIOS = ("default", "same", "separate", "same-wide", "smt-sibling")
+SCENARIOS = ("default", "same", "separate", "same-wide", "smt-sibling", "remote-numa")
 # per-device IRQs that are not RX/TX queues (ENA "ena-mgmnt", mlx5 "async", ...)
 NON_QUEUE_IRQ = re.compile(r"(?i)mgmnt|mgmt|async|admin|ctrl|-aq\b|misc")
 # ethtool -S counters worth recording; *allowance_exceeded are AWS ENA shaping drops
@@ -593,7 +599,18 @@ def run_client(args, peer, rate):
 # --------------------------------------------------------------------------- #
 # run
 
-def scenario_layout(name, app, irq):
+def remote_cpus(app, count, isolated=()):
+    """CPUs on a NUMA node other than the app's, avoiding isolated CPUs and the app's siblings."""
+    app_nodes = {cpu_node(c) for c in app}
+    online = parse_cpulist(read("/sys/devices/system/cpu/online", "0"))
+    avoid = set(isolated) | {s for c in app for s in smt_siblings(c)}
+    pool = [c for c in online if cpu_node(c) not in app_nodes and c not in avoid]
+    # one logical CPU per physical core first
+    firsts = [c for c in pool if min(smt_siblings(c)) == c]
+    return (firsts + [c for c in pool if c not in firsts])[:max(1, count)]
+
+
+def scenario_layout(name, app, irq, remote=None):
     """Return (server_cpus, irq_cpus or None for 'leave as found')."""
     if name == "default":
         return app, None
@@ -609,6 +626,10 @@ def scenario_layout(name, app, irq):
         if not sib:
             sys.exit("smt-sibling: app CPUs have no hyperthread siblings (SMT off?)")
         return app, sib
+    if name == "remote-numa":
+        if not remote:
+            sys.exit("remote-numa: no CPUs on another NUMA node")
+        return app, remote
     raise ValueError(name)
 
 
@@ -684,8 +705,12 @@ class RpcWorkload:
             stats_after = nic_stats(nic.devs)
         finally:
             srv = stop_server(server)
+        sysd = counter_delta(before, after, srv_cpus, target)
         return {"workload": "rpc", "load_label": load[1], "client": client, "server": srv,
-                "system": counter_delta(before, after, srv_cpus, target),
+                "system": sysd, "proximity": proximity(sysd, srv_cpus,
+                                                       "exact: CPU steering hands each request to the thread "
+                                                       "on the CPU that processed it" if self.args.cpu_steer
+                                                       else "interrupt on a core running a server thread"),
                 "nic_stats": nic_stats_delta(stats_before, stats_after)}
 
     def log_line(self, rec):
@@ -693,6 +718,18 @@ class RpcWorkload:
         return (f"{c['achieved_rps']:.0f} rps, p50 {c['rtt']['p50_ns'] / 1e3:.1f}us "
                 f"p99 {c['rtt']['p99_ns'] / 1e3:.1f}us p99.9 {c['rtt']['p999_ns'] / 1e3:.1f}us, "
                 f"svc p99 {srv['service']['p99_ns'] / 1e3:.2f}us, lost {c['lost_pct']:.3f}%")
+
+
+def proximity(sysd, hot_cpus, basis):
+    """How much of the NIC interrupt work happened on the cores where the application threads run."""
+    byc = {int(k): v for k, v in (sysd.get("nic_irqs_by_cpu") or {}).items()}
+    total = sum(byc.values())
+    hot = sorted(set(hot_cpus))
+    hit = sum(v for c, v in byc.items() if c in hot)
+    covered = [c for c in hot if byc.get(c)]
+    return {"pct": round(100.0 * hit / total, 1) if total else None, "nic_irqs": total,
+            "app_cpus": hot, "app_cpus_with_irqs": covered,
+            "coverage_pct": round(100.0 * len(covered) / len(hot), 1) if hot else None, "basis": basis}
 
 
 def rpc_loads(spec):
@@ -785,6 +822,23 @@ def cmd_run(args):
             warn(f"skipping scenario {s}: {why}")
             skipped[s] = why
             scenarios.remove(s)
+    remote = []
+    if "remote-numa" in scenarios:
+        isolated = parse_cpulist(read("/sys/devices/system/cpu/isolated", "") or "")
+        remote = parse_cpulist(args.remote_cpus) if args.remote_cpus else remote_cpus(app, len(irq), isolated)
+        if not remote:
+            why = "this host has a single NUMA node, so there is no remote socket to put interrupts on"
+            warn(f"skipping scenario remote-numa: {why}")
+            skipped["remote-numa"] = why
+            scenarios.remove("remote-numa")
+        else:
+            log(f"remote-numa: IRQs go to CPUs {fmt_cpulist(remote)} (node(s) "
+                f"{sorted({cpu_node(c) for c in remote})}; app on {sorted({cpu_node(c) for c in app})})")
+    if "smt-sibling" in scenarios and not ({s for c in app for s in smt_siblings(c)} - set(app)):
+        why = "the app CPUs have no hyperthread siblings (SMT is off or unavailable)"
+        warn(f"skipping scenario smt-sibling: {why}")
+        skipped["smt-sibling"] = why
+        scenarios.remove("smt-sibling")
     preflight(args, app, irq, devs, nic)
     irq_map = {}
     if args.irq_map:
@@ -812,7 +866,7 @@ def cmd_run(args):
         if args.channels:
             log(f"would set {devs} to {args.channels} queues (now {[get_channels(d) for d in devs]})")
         for rep, load, s in plan:
-            srv, ic = scenario_layout(s, app, irq)
+            srv, ic = scenario_layout(s, app, irq, remote)
             log(f"  rep {rep} load {load[1]}: {s:11s} app@{fmt_cpulist(srv)} "
                 f"irqs@{fmt_cpulist(ic) if ic else 'as-found'} rps={args.rps if ic else 'as-found'}")
         return
@@ -848,7 +902,7 @@ def cmd_run(args):
     nic.save(was_active, channels_before)
     meta = {"args": vars(args), "started": stamp, "system": system_info(devs),
             "initial_state": nic.saved, "app_cpus": app, "irq_cpus": irq,
-            "skipped_scenarios": skipped, "loads": [list(l) for l in loads]}
+            "skipped_scenarios": skipped, "loads": [list(l) for l in loads], "remote_cpus": remote}
     meta.update(workload.meta())
     if args.workload == "app":
         meta["irqs_allowed_on_app_cpus"] = irqapp.irqs_on_cpus(app)
@@ -867,7 +921,7 @@ def cmd_run(args):
         with open(os.path.join(outdir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
         for n, (rep, load, s) in enumerate(plan, 1):
-            srv_cpus, irq_cpus = scenario_layout(s, app, irq)
+            srv_cpus, irq_cpus = scenario_layout(s, app, irq, remote)
             if irq_cpus is None:
                 nic.apply_saved()
             else:
@@ -986,7 +1040,11 @@ def main():
                    help="where the load generator runs: 'local' (loopback smoke test) or ssh:[user@]host")
     r.add_argument("--deploy", action="store_true", help="copy and build rpcbench on the peer first")
     r.add_argument("--server-addr", help="address the peer connects to (default: iface IPv4)")
-    r.add_argument("--scenarios", default="default,same,separate,same-wide")
+    r.add_argument("--scenarios", default="same,separate,same-wide",
+                   help="comma list from default, same, separate, same-wide, smt-sibling, remote-numa "
+                        "(default: same,separate,same-wide; add smt-sibling,remote-numa for the full "
+                        "proximity ladder)")
+    r.add_argument("--remote-cpus", help="remote-numa: CPUs on another NUMA node (default: auto)")
     r.add_argument("--rates", help="rpc: total req/s, 0 = closed loop (default 10000,50000,0). app: feed "
                                    "msgs/s, or pcap speed multipliers like 1x,2x, or top")
     r.add_argument("--reps", type=int, default=5)
